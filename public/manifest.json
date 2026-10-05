@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "X Autopilot — 智能运营助手",
+  "version": "0.1.0",
+  "description": "基于 LLM 的 X (Twitter) 智能运营助手：手动生成评论 + 自动巡航互动，全本地运行，密钥不出本机。",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "sidePanel", "activeTab", "scripting", "alarms", "tabs"],
+  "host_permissions": ["https://x.com/*", "https://twitter.com/*"],
+  "optional_host_permissions": ["https://*/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "side_panel": {
+    "default_path": "src/sidepanel/index.html"
+  },
+  "action": {
+    "default_title": "打开 X Autopilot 侧边栏",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+X" },
+      "description": "打开/关闭 X Autopilot 侧边栏"
+    }
+  },
+  "web_accessible_resources": []
+}

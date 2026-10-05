@@ -1,0 +1,128 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --xa-bg: #f7f8fa;
+    --xa-surface: #ffffff;
+    --xa-border: #e3e7ed;
+    --xa-text: #101317;
+    --xa-muted: #5b6472;
+  }
+
+  .dark {
+    color-scheme: dark;
+    --xa-bg: #0b0d10;
+    --xa-surface: #15181e;
+    --xa-border: #262b34;
+    --xa-text: #e6eaf0;
+    --xa-muted: #8b95a5;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--xa-bg);
+    color: var(--xa-text);
+    font-family: 'Segoe UI', system-ui, -apple-system, Roboto, sans-serif;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  /* 侧边栏宽度变化时滚动条容易跳，收窄并做静默处理 */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--xa-border);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--xa-muted);
+  }
+
+  :focus-visible {
+    outline: 2px solid #1d9bf0;
+    outline-offset: 1px;
+    border-radius: 4px;
+  }
+}
+
+@layer components {
+  .xa-card {
+    @apply rounded-xl border p-3;
+    background: var(--xa-surface);
+    border-color: var(--xa-border);
+  }
+
+  .xa-label {
+    @apply mb-1 block text-[11px] font-medium tracking-wide;
+    color: var(--xa-muted);
+  }
+
+  .xa-input {
+    @apply w-full rounded-lg border px-2.5 py-2 text-[12px] transition-colors;
+    background: var(--xa-bg);
+    border-color: var(--xa-border);
+    color: var(--xa-text);
+  }
+  .xa-input:focus {
+    @apply border-brand outline-none;
+    box-shadow: 0 0 0 3px rgba(29, 155, 240, 0.14);
+  }
+  .xa-input::placeholder {
+    color: var(--xa-muted);
+    opacity: 0.7;
+  }
+
+  .xa-btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-[12px] font-medium transition-all;
+    @apply disabled:cursor-not-allowed disabled:opacity-45;
+  }
+
+  .xa-btn-primary {
+    @apply xa-btn bg-brand text-white hover:bg-brand-dim active:scale-[0.985];
+  }
+
+  .xa-btn-ghost {
+    @apply xa-btn border;
+    background: transparent;
+    border-color: var(--xa-border);
+    color: var(--xa-text);
+  }
+  .xa-btn-ghost:hover {
+    background: var(--xa-bg);
+  }
+
+  .xa-btn-danger {
+    @apply xa-btn bg-danger text-white hover:brightness-95;
+  }
+
+  .xa-chip {
+    @apply cursor-pointer select-none rounded-full border px-2.5 py-1 text-[11px] transition-all;
+    background: transparent;
+    border-color: var(--xa-border);
+    color: var(--xa-muted);
+  }
+  .xa-chip[data-active='true'] {
+    @apply border-brand bg-brand/10 font-medium;
+    color: #1d9bf0;
+  }
+
+  .xa-divider {
+    @apply my-3 h-px w-full;
+    background: var(--xa-border);
+  }
+}
