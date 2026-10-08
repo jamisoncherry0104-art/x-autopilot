@@ -11,7 +11,6 @@ import {
   getRuntime,
   getSettings,
   patchSettings as patchSettingsStorage,
-  resolveTheme,
   subscribeLogs,
   subscribeRuntime,
   subscribeSettings,
@@ -98,8 +97,14 @@ export function useSettings(): SettingsStore {
   useEffect(() => {
     if (!settings) return;
     applyTheme(settings.theme);
-    void resolveTheme(settings.theme);
   }, [settings]);
+
+  // 卸载时清掉"已保存"闪现的定时器，避免对已卸载组件 setState
+  useEffect(() => {
+    return () => {
+      if (savingTimer.current) window.clearTimeout(savingTimer.current);
+    };
+  }, []);
 
   return { settings, loading, saving, update, replace, reload };
 }
@@ -157,6 +162,35 @@ export function useRuntime(): RuntimeStore {
   }, []);
 
   return { runtime, refresh };
+}
+
+/* ------------------------------------------------------------------ */
+
+/** 当前激活标签页的 URL，用于判断是否处于推文详情页 */
+export function useActiveTabUrl(pollMs = 1200): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+
+    const probe = async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (alive) setUrl(tab?.url ?? null);
+      } catch {
+        if (alive) setUrl(null);
+      }
+    };
+
+    void probe();
+    const timer = window.setInterval(probe, pollMs);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [pollMs]);
+
+  return url;
 }
 
 /* ------------------------------------------------------------------ */

@@ -27,6 +27,7 @@ import {
   microScroll,
   randomDelay,
   scrollIntoComfortZone,
+  setAutoRoundInFlight,
   setHumanizerAborted,
   smoothScrollBy,
 } from './humanizer';
@@ -130,7 +131,11 @@ const handlers: Record<ToContentMessage['type'], Handler> = {
 /* 消息路由                                                            */
 /* ------------------------------------------------------------------ */
 
-chrome.runtime.onMessage.addListener((message: ToContentMessage, _sender, sendResponse) => {
+const manualRouter = (
+  message: ToContentMessage,
+  _sender: chrome.runtime.MessageSender,
+  sendResponse: (response?: unknown) => void,
+): boolean => {
   const handler = handlers[message?.type as ToContentMessage['type']];
   if (!handler) return false;
 
@@ -138,15 +143,15 @@ chrome.runtime.onMessage.addListener((message: ToContentMessage, _sender, sendRe
     .then(sendResponse)
     .catch((err: Error) => sendResponse(fail(`执行异常：${err.message}`, 'HANDLER_THROWN')));
   return true; // 保持通道打开以支持异步响应
-});
+};
 
 /* ------------------------------------------------------------------ */
 /* 自动模式：由本脚本驱动的原子步骤                                    */
 /* ------------------------------------------------------------------ */
 
-async function swSleep(minMs: number, maxMs: number): Promise<void> {
+/** 轮次内的节奏停顿：本地随机取时长，可被紧急制动打断 */
+async function humanPause(minMs: number, maxMs: number): Promise<void> {
   const ms = Math.round(minMs + Math.random() * Math.max(0, maxMs - minMs));
-  // 本地打散成可见的 WAIT 日志，同时支持紧急制动打断
   await interruptibleDelay(ms);
 }
 
@@ -173,6 +178,7 @@ export interface RoundOutcome {
   likes: number;
   comments: number;
   follows: number;
+  drafts: number;
   scanned: number;
   seen: string[];
   aborted: boolean;
@@ -184,6 +190,7 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
     likes: 0,
     comments: 0,
     follows: 0,
+    drafts: 0,
     scanned: 0,
     seen: [...payload.seen],
     aborted: false,
@@ -207,6 +214,17 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
   let iterations = 0;
   let idleStreak = 0;
 
+  /*
+   * 关注点击数的硬上限。
+   *
+   * 关注成功与否要靠 DOM 状态翻转来确认，而这个确认在悬停卡片被 React
+   * 就地重渲染时并不可靠。只拿 outcome.follows 当闸门的话，一旦确认失败
+   * 计数就永远不涨，循环会一直点关注下去 —— 这是直接放大账号风险的方向。
+   *
+   * 所以另记一份「真的点出去多少次」，点满配额就停手，宁可少报也不多关注。
+   */
+  let followClicks = 0;
+
   swLog('INFO', `本轮开始：目标 赞${payload.likeQuota} / 评${payload.commentQuota} / 关注${payload.followQuota}`);
 
   try {
@@ -220,7 +238,7 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
       const done =
         outcome.likes >= payload.likeQuota &&
         outcome.comments >= payload.commentQuota &&
-        outcome.follows >= payload.followQuota;
+        (outcome.follows >= payload.followQuota || followClicks >= payload.followQuota);
       if (done) {
         swLog('DONE', '本轮配额已全部达成');
         break;
@@ -242,7 +260,7 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
           break;
         }
         await smoothScrollBy(600 + Math.random() * 500);
-        await swSleep(payload.scrollDelaySec[0] * 1000, payload.scrollDelaySec[1] * 1000);
+        await humanPause(payload.scrollDelaySec[0] * 1000, payload.scrollDelaySec[1] * 1000);
         continue;
       }
 
@@ -265,7 +283,7 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
           break;
         }
         await smoothScrollBy(520 + Math.random() * 620);
-        await swSleep(payload.scrollDelaySec[0] * 1000, payload.scrollDelaySec[1] * 1000);
+        await humanPause(payload.scrollDelaySec[0] * 1000, payload.scrollDelaySec[1] * 1000);
         continue;
       }
 
@@ -291,7 +309,7 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
         } else {
           swLog('WARNING', '点赞失败：按钮不可用或被风控拦截');
         }
-        await swSleep(payload.actionDelaySec[0] * 1000, payload.actionDelaySec[1] * 1000);
+        await humanPause(payload.actionDelaySec[0] * 1000, payload.actionDelaySec[1] * 1000);
       }
 
       /* --- 关注 --- */
@@ -299,8 +317,13 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
        * 关注必须排在评论之前：评论会导航到详情页再返回，
        * 返回后时间线可能已重新渲染，这里持有的 el 引用会失效。
        */
-      if (outcome.follows < payload.followQuota && Math.random() < payload.followProbability) {
+      if (
+        outcome.follows < payload.followQuota &&
+        followClicks < payload.followQuota &&
+        Math.random() < payload.followProbability
+      ) {
         const res = await followAuthor(el);
+        if (res === 'followed' || res === 'failed') followClicks += 1;
         if (res === 'followed') {
           outcome.follows += 1;
           swLog('ACTION', `已关注 @${snap.authorHandle}（${outcome.follows}/${payload.followQuota}）`);
@@ -309,9 +332,9 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
         } else if (res === 'unavailable') {
           swLog('INFO', '时间线未提供关注入口，跳过');
         } else {
-          swLog('WARNING', '关注操作失败');
+          swLog('WARNING', `关注 @${snap.authorHandle}：已点击但未能确认状态翻转（${followClicks}/${payload.followQuota}）`);
         }
-        await swSleep(payload.actionDelaySec[0] * 1000, payload.actionDelaySec[1] * 1000);
+        await humanPause(payload.actionDelaySec[0] * 1000, payload.actionDelaySec[1] * 1000);
       }
 
       /* --- 评论 --- */
@@ -340,19 +363,26 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
             const readingOk = await readingDwell(payload.readDwellMs);
             if (readingOk) {
               swLog('ACTION', `已进入详情页 @${detail.main.authorHandle}，请求 AI 生成评论…`);
-              const gen = await sendToSw<{ text: string }>({ type: 'SW_GENERATE_FOR', snapshot: detail.main });
+              const gen = await sendToSw<{ text: string }>({
+                type: 'SW_GENERATE_FOR',
+                snapshot: detail.main,
+                // 上文真的传给模型 —— 早先只传 main，UI 那句「作为生成上下文」是空的
+                ancestors: detail.ancestors,
+              });
 
               if (!gen.ok) {
                 swLog('ERROR', `评论生成失败：${gen.error}`);
               } else {
                 const comment = await postCommentOnDetailPage(gen.data.text, payload.autoSubmitComment);
-                if (comment.ok) {
+                if (comment.ok && comment.submitted) {
                   outcome.comments += 1;
+                  swLog('ACTION', `评论已提交（${outcome.comments}/${payload.commentQuota}）：${gen.data.text.slice(0, 30)}…`);
+                } else if (comment.ok) {
+                  // 草稿模式：返回时间线时这个草稿就被销毁了，不能算作完成一次评论
+                  outcome.drafts += 1;
                   swLog(
                     'ACTION',
-                    comment.submitted
-                      ? `评论已提交（${outcome.comments}/${payload.commentQuota}）：${gen.data.text.slice(0, 30)}…`
-                      : `已填入草稿未发送（${outcome.comments}/${payload.commentQuota}）：${gen.data.text.slice(0, 30)}…`,
+                    `已填入草稿未发送（本轮第 ${outcome.drafts} 条，评论配额仍为 ${outcome.comments}/${payload.commentQuota}）：${gen.data.text.slice(0, 30)}…`,
                   );
                 } else {
                   swLog('WARNING', comment.reason ?? '评论写入失败，跳过该条');
@@ -369,7 +399,7 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
           }
         }
 
-        await swSleep(payload.actionDelaySec[0] * 1000, payload.actionDelaySec[1] * 1000);
+        await humanPause(payload.actionDelaySec[0] * 1000, payload.actionDelaySec[1] * 1000);
       }
 
       await microScroll();
@@ -377,6 +407,22 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
   } catch (err) {
     outcome.error = (err as Error).message;
     swLog('ERROR', `本轮异常终止：${outcome.error}`);
+  }
+
+  if (followClicks > outcome.follows) {
+    swLog(
+      'WARNING',
+      `本轮共点击关注 ${followClicks} 次，仅确认成功 ${outcome.follows} 次；已按点击数封顶，不再继续关注`,
+    );
+  }
+
+  if (!payload.autoSubmitComment && outcome.drafts > 0 && outcome.comments < payload.commentQuota) {
+    swLog(
+      'WARNING',
+      `「自动提交评论」处于关闭状态：本轮填入 ${outcome.drafts} 条草稿（返回时间线后即被丢弃），` +
+        `实际发送 ${outcome.comments}/${payload.commentQuota}。` +
+        `草稿模式不会填满评论配额，需要真正发帖请在设置里打开自动提交。`,
+    );
   }
 
   outcome.aborted = isHumanizerAborted();
@@ -412,7 +458,7 @@ async function postCommentOnDetailPage(
   if (!autoSubmit) return { ok: true, submitted: false };
 
   // 3) 发送
-  await swSleep(1200, 2200);
+  await humanPause(1200, 2200);
   const sub = await submitComment();
   if (!sub.ok) return { ok: false, submitted: false, reason: `评论提交失败：${sub.reason}` };
   return { ok: true, submitted: true };
@@ -427,24 +473,50 @@ interface AutoRunMessage {
   payload: RoundPayload;
 }
 
-chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+const autoRoundListener = (
+  message: unknown,
+  _sender: chrome.runtime.MessageSender,
+  sendResponse: (response?: unknown) => void,
+): boolean => {
   const msg = message as AutoRunMessage;
   if (msg?.type !== 'CS_AUTO_ROUND') return false;
 
+  setAutoRoundInFlight(true);
   setHumanizerAborted(false);
   runAutoRound(msg.payload)
     .then((outcome) => sendResponse({ ok: true, data: outcome } satisfies Result<RoundOutcome>))
-    .catch((err: Error) => sendResponse({ ok: false, error: err.message } satisfies Result<never>));
+    .catch((err: Error) => sendResponse({ ok: false, error: err.message } satisfies Result<never>))
+    .finally(() => setAutoRoundInFlight(false));
   return true;
-});
+};
 
-// 紧急制动：由 SW 广播
-chrome.runtime.onMessage.addListener((message: unknown) => {
+// 紧急制动：由 SW 广播。只在有自动轮次在飞时真正生效，见 humanizer.ts
+const abortListener = (message: unknown): boolean => {
   const msg = message as { type?: string };
   if (msg?.type === 'CS_ABORT') {
     setHumanizerAborted(true);
   }
   return false;
-});
+};
 
-swLog('INFO', 'Content script 已就绪');
+/**
+ * 幂等守卫。
+ *
+ * manifest 已经声明了 content_scripts，但 SW 的 ensureContentScript() 在 ping
+ * 连续失败后还会用 chrome.scripting.executeScript 再注入一次做兜底。x.com 是
+ * 重型 SPA，document_idle 可能晚于 tab.status === 'complete'，于是兜底注入会和
+ * 清单注入叠加 —— 监听器双份注册，一条 CS_AUTO_ROUND 让整轮并发跑两遍，
+ * 点赞 / 评论 / 关注全部翻倍。
+ *
+ * 两份脚本跑在同一个 isolated world，window 是共享的，因此用它做标记。
+ */
+const LOAD_GUARD = '__xAutopilotContentLoaded';
+const guardScope = window as unknown as Record<string, boolean>;
+
+if (!guardScope[LOAD_GUARD]) {
+  guardScope[LOAD_GUARD] = true;
+  chrome.runtime.onMessage.addListener(manualRouter);
+  chrome.runtime.onMessage.addListener(autoRoundListener);
+  chrome.runtime.onMessage.addListener(abortListener);
+  swLog('INFO', 'Content script 已就绪');
+}

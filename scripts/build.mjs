@@ -22,9 +22,11 @@ const targets = [
 ];
 
 async function runVite() {
-  const viteBin = resolve(root, 'node_modules/.bin/vite');
-  const cmd = process.platform === 'win32' ? `${viteBin}.cmd` : viteBin;
-  const res = spawnSync(cmd, ['build'], { cwd: root, stdio: 'inherit', shell: process.platform === 'win32' });
+  // 直接用当前 node 跑 vite 的 JS 入口，避开 .cmd shim + shell:true。
+  // 后者在 Node 20+ 会触发 DEP0190（带 args 且 shell:true 已废弃），
+  // 且 Windows 下 .cmd 不经 shell 还会抛 EINVAL，跨平台都不稳。
+  const viteJs = resolve(root, 'node_modules/vite/bin/vite.js');
+  const res = spawnSync(process.execPath, [viteJs, 'build'], { cwd: root, stdio: 'inherit' });
   if (res.status !== 0) throw new Error(`vite build 失败，退出码 ${res.status}`);
 }
 

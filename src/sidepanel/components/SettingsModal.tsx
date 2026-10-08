@@ -457,7 +457,7 @@ export default function SettingsModal({ settings, update, replace, onToast }: Pr
           <Card>
             <SectionTitle
               title="模板变量"
-              hint="可用变量：{tweet_text} {tweet_author} {tweet_handle} {persona} {max_chars} {lang_rule}"
+              hint="可用变量：{tweet_text} {tweet_author} {tweet_handle} {tweet_context} {persona} {max_chars} {lang_rule}"
             />
             {unknownVars.length > 0 && (
               <p className="rounded-lg bg-warn/10 px-2.5 py-2 text-[11px] leading-snug text-warn">
@@ -562,16 +562,16 @@ export default function SettingsModal({ settings, update, replace, onToast }: Pr
                   }}
                 >
                   <div className="mb-1.5 flex items-center gap-1.5">
-                    <input
-                      className="xa-input !py-1 !text-[11.5px]"
-                      defaultValue={p.label}
-                      onBlur={(e) => {
+                    <TextInput
+                      className="!py-1 !text-[11.5px]"
+                      value={p.label}
+                      ariaLabel={`语气 ${idx + 1} 名称`}
+                      onCommit={(v) => {
                         const personas = settings.prompt.personas.map((x, i) =>
-                          i === idx ? { ...x, label: e.target.value || x.label } : x,
+                          i === idx ? { ...x, label: v || x.label } : x,
                         );
                         void update({ prompt: { personas } });
                       }}
-                      aria-label={`语气 ${idx + 1} 名称`}
                     />
                     {p.id === settings.prompt.activePersonaId ? (
                       <Badge tone="brand">使用中</Badge>
@@ -598,14 +598,14 @@ export default function SettingsModal({ settings, update, replace, onToast }: Pr
                       删除
                     </button>
                   </div>
-                  <textarea
+                  <TextArea
                     rows={2}
-                    className="xa-input resize-y !text-[11px] leading-relaxed"
-                    defaultValue={p.body}
-                    aria-label={`${p.label} 描述`}
-                    onBlur={(e) => {
+                    className="!text-[11px]"
+                    value={p.body}
+                    ariaLabel={`${p.label} 描述`}
+                    onCommit={(v) => {
                       const personas = settings.prompt.personas.map((x, i) =>
-                        i === idx ? { ...x, body: e.target.value } : x,
+                        i === idx ? { ...x, body: v } : x,
                       );
                       void update({ prompt: { personas } });
                     }}

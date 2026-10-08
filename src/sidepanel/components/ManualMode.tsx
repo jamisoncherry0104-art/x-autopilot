@@ -3,7 +3,7 @@ import { Send, Sparkles, Terminal, UserPlus } from 'lucide-react';
 import type { AppSettings, FollowOutcome, LogEntry, TweetDetailContext } from '../../shared/types';
 import type { DeepPartial } from '../../shared/storage';
 import { cn, formatClock } from '../../shared/utils';
-import { callBackground, callTab, findXTabId, isTweetDetailUrl } from '../hooks/useStorage';
+import { callBackground, callTab, findXTabId, isTweetDetailUrl, useActiveTabUrl } from '../hooks/useStorage';
 import { Badge, Card, SectionTitle, Spinner } from './ui';
 
 interface Props {
@@ -17,32 +17,16 @@ type Stage = 'idle' | 'extracting' | 'generating' | 'filling' | 'submitting' | '
 
 export default function ManualMode({ settings, update, logs, onToast }: Props) {
   const [stage, setStage] = useState<Stage>('idle');
-  const [tabUrl, setTabUrl] = useState<string | null>(null);
+  const tabUrl = useActiveTabUrl();
   const [snapshot, setSnapshot] = useState<TweetDetailContext | null>(null);
   const [draft, setDraft] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
   /** 已自动处理过的详情页 URL，避免同一页面反复触发自动链 */
   const autoHandledRef = useRef<string | null>(null);
   /** 防止自动链重入（stage 是异步更新的，不能作为唯一门闩） */
   const autoBusyRef = useRef(false);
 
   const onDetailPage = isTweetDetailUrl(tabUrl);
-
-  /* 跟踪当前标签页 */
-  useEffect(() => {
-    let alive = true;
-    const probe = async () => {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (alive) setTabUrl(tab?.url ?? null);
-    };
-    void probe();
-    const t = window.setInterval(probe, 1200);
-    return () => {
-      alive = false;
-      window.clearInterval(t);
-    };
-  }, []);
 
   /* 页面切换后清空旧快照，避免生成到上一条推文 */
   useEffect(() => {
@@ -147,11 +131,12 @@ export default function ManualMode({ settings, update, logs, onToast }: Props) {
       if (!target) return false;
       setError(null);
       setStage('generating');
-      abortRef.current = new AbortController();
       try {
         const res = await callBackground<{ text: string }>({
           type: 'LLM_GENERATE',
           snapshot: target.main,
+          // 卡片上显示的「上文 N 条（作为生成上下文）」到这里才真的进入 prompt
+          ancestors: target.ancestors,
         });
         setDraft(res.text);
 
@@ -168,7 +153,6 @@ export default function ManualMode({ settings, update, logs, onToast }: Props) {
         return false;
       } finally {
         setStage('idle');
-        abortRef.current = null;
       }
     },
     [snapshot, settings.prompt.autoSend, settings.prompt.autoSendDelayMs, onToast, fillAndSubmit],

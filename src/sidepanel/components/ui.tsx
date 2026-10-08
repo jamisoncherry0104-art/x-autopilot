@@ -70,6 +70,8 @@ export function TextInput({
   monospace,
   id,
   delay = 400,
+  className,
+  ariaLabel,
 }: {
   value: string;
   onCommit: (v: string) => void;
@@ -78,6 +80,8 @@ export function TextInput({
   monospace?: boolean;
   id?: string;
   delay?: number;
+  className?: string;
+  ariaLabel?: string;
 }) {
   const [local, setLocal] = useState(value);
   const timer = useRef<number | null>(null);
@@ -98,9 +102,10 @@ export function TextInput({
     <input
       id={id}
       type={type}
-      className={cn('xa-input', monospace && 'font-mono text-[11px]')}
+      className={cn('xa-input', monospace && 'font-mono text-[11px]', className)}
       value={local}
       placeholder={placeholder}
+      aria-label={ariaLabel}
       onFocus={() => {
         focused.current = true;
       }}
@@ -125,6 +130,8 @@ export function TextArea({
   placeholder,
   monospace,
   delay = 500,
+  className,
+  ariaLabel,
 }: {
   value: string;
   onCommit: (v: string) => void;
@@ -132,6 +139,8 @@ export function TextArea({
   placeholder?: string;
   monospace?: boolean;
   delay?: number;
+  className?: string;
+  ariaLabel?: string;
 }) {
   const [local, setLocal] = useState(value);
   const timer = useRef<number | null>(null);
@@ -150,9 +159,10 @@ export function TextArea({
   return (
     <textarea
       rows={rows}
-      className={cn('xa-input resize-y leading-relaxed', monospace && 'font-mono text-[11px]')}
+      className={cn('xa-input resize-y leading-relaxed', monospace && 'font-mono text-[11px]', className)}
       value={local}
       placeholder={placeholder}
+      aria-label={ariaLabel}
       onFocus={() => {
         focused.current = true;
       }}
