@@ -287,17 +287,8 @@ export interface SwLogMsg {
   scope?: LogEntry['scope'];
 }
 
-export interface SwNavigateMsg {
-  type: 'SW_NAVIGATE';
-  url: string;
-}
 export interface SwGetTabMsg {
   type: 'SW_GET_TAB';
-}
-export interface SwSleepMsg {
-  type: 'SW_SLEEP';
-  minMs: number;
-  maxMs: number;
 }
 export interface SwToContentMsg {
   type: 'SW_TO_CONTENT';
@@ -306,7 +297,7 @@ export interface SwToContentMsg {
   payload: ToContentMessage;
 }
 
-export type ToBackgroundMessage = SwLogMsg | SwNavigateMsg | SwGetTabMsg | SwSleepMsg | SwToContentMsg;
+export type ToBackgroundMessage = SwLogMsg | SwGetTabMsg | SwToContentMsg;
 
 /* --- UI <-> Background 控制面 --- */
 export interface UiStartAutoMsg {

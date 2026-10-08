@@ -104,8 +104,11 @@ export function preflight(settings: AppSettings): PreflightIssue[] {
   if (!llm.apiKey.trim()) {
     issues.push({ field: 'apiKey', message: '未填写 API Key，所有生成功能不可用', severity: 'error' });
   }
-  if (!/^https?:\/\//i.test(llm.baseUrl.trim())) {
-    issues.push({ field: 'baseUrl', message: 'Base URL 必须以 http:// 或 https:// 开头', severity: 'error' });
+  if (!llm.baseUrl.trim()) {
+    issues.push({ field: 'baseUrl', message: '未填写 Base URL', severity: 'error' });
+  } else if (!/^https?:\/\//i.test(llm.baseUrl.trim())) {
+    // normalizeBaseUrl 会给缺协议的地址自动补 https://，因此这只是提醒，不是错误
+    issues.push({ field: 'baseUrl', message: 'Base URL 未写协议，将按 https:// 处理', severity: 'warn' });
   }
   if (!llm.model.trim()) {
     issues.push({ field: 'model', message: '未填写模型名称', severity: 'error' });
@@ -153,10 +156,6 @@ export function preflight(settings: AppSettings): PreflightIssue[] {
   return issues;
 }
 
-export function hasBlockingIssue(issues: PreflightIssue[]): boolean {
-  return issues.some((i) => i.severity === 'error');
-}
-
 /* ------------------------------------------------------------------ */
 /* 运行态                                                              */
 /* ------------------------------------------------------------------ */
@@ -191,7 +190,24 @@ export async function getLogs(): Promise<LogEntry[]> {
   return (await rawGet<LogEntry[]>(STORAGE_KEYS.logs)) ?? [];
 }
 
-export async function appendLog(entry: Omit<LogEntry, 'id' | 'ts'> & { ts?: number }): Promise<LogEntry> {
+/**
+ * 日志写入串行队列。
+ *
+ * appendLog 是「读整个数组 → push → 写回」的读改写。SW 里多处会并发写日志
+ * （轮次事件、LLM 代理、profile 关注同时发生），两个 appendLog 交错时，
+ * 后读到旧快照的那个会用不含对方条目的数组覆盖回去，日志静默丢失。
+ * 把所有写入（含 clear）串到同一条 promise 链上，保证顺序与可见性。
+ */
+let logQueue: Promise<unknown> = Promise.resolve();
+
+function enqueueLogWrite<T>(task: () => Promise<T>): Promise<T> {
+  const run = logQueue.then(task, task);
+  // 链上挂一个吞掉异常的尾节点，避免某次写入失败后续全部 reject
+  logQueue = run.catch(() => undefined);
+  return run;
+}
+
+export function appendLog(entry: Omit<LogEntry, 'id' | 'ts'> & { ts?: number }): Promise<LogEntry> {
   const full: LogEntry = {
     id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
     ts: entry.ts ?? Date.now(),
@@ -199,14 +215,17 @@ export async function appendLog(entry: Omit<LogEntry, 'id' | 'ts'> & { ts?: numb
     scope: entry.scope,
     message: entry.message,
   };
-  const logs = await getLogs();
-  const next = [...logs, full].slice(-LOG_BUFFER_LIMIT);
-  await rawSet(STORAGE_KEYS.logs, next);
-  return full;
+  return enqueueLogWrite(async () => {
+    const logs = await getLogs();
+    await rawSet(STORAGE_KEYS.logs, [...logs, full].slice(-LOG_BUFFER_LIMIT));
+    return full;
+  });
 }
 
-export async function clearLogs(): Promise<void> {
-  await rawSet(STORAGE_KEYS.logs, []);
+export function clearLogs(): Promise<void> {
+  return enqueueLogWrite(async () => {
+    await rawSet(STORAGE_KEYS.logs, []);
+  });
 }
 
 /* ------------------------------------------------------------------ */

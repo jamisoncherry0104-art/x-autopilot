@@ -18,15 +18,6 @@ export function randomFloat(min: number, max: number): number {
   return Math.random() * (max - min) + min;
 }
 
-export function clamp(v: number, lo: number, hi: number): number {
-  return Math.min(hi, Math.max(lo, v));
-}
-
-/** 概率命中 */
-export function chance(p: number): boolean {
-  return Math.random() < clamp(p, 0, 1);
-}
-
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, Math.max(0, ms)));
 }
@@ -66,8 +57,4 @@ export function fingerprint(input: string): string {
     h2 = Math.imul(h2 ^ c, 0x85ebca6b);
   }
   return `${(h1 >>> 0).toString(36)}${(h2 >>> 0).toString(36)}`;
-}
-
-export function uid(prefix = ''): string {
-  return `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }

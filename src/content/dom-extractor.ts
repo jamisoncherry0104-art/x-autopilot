@@ -156,15 +156,6 @@ export function extractTimeline(limit = 30): TweetSnapshot[] {
   return out;
 }
 
-/** X 的保留一级路径，不能当作"用户名" */
-const RESERVED_SEGMENT = /^(home|explore|notifications|messages|settings|search|compose|i)$/;
-
-/** 判断当前是否处于推文详情页 */
-export function isDetailPage(): boolean {
-  const m = /^\/([^/]+)\/status\/\d+/.exec(location.pathname);
-  return !!m && !RESERVED_SEGMENT.test(m[1]);
-}
-
 /**
  * 详情页抓取：主推文 = 视口内最上方且拥有最大正文块的那条；
  * 其余位于其上方的作为 ancestors，提供上下文给 LLM。
@@ -173,15 +164,9 @@ export function extractDetail(): { main: TweetSnapshot; ancestors: TweetSnapshot
   const articles = queryAll(X_SELECTORS.tweet).filter(isVisible);
   if (articles.length === 0) return null;
 
-  // 详情页中主推文的特征：正文块存在，且其祖先链里没有另一条 tweet（排除嵌套引用）
-  let mainEl: Element | null = null;
-  for (const a of articles) {
-    if (!a.querySelector(X_SELECTORS.tweetText)) continue;
-    if (mainEl === null) {
-      mainEl = a;
-      break;
-    }
-  }
+  // 兜底：primaryColumn 不存在时，取第一条含正文块的 tweet（排除纯转发/媒体卡）
+  let mainEl: Element | null = articles.find((a) => a.querySelector(X_SELECTORS.tweetText)) ?? null;
+
   // 更精确：主推文在 DOM 中通常位于 primaryColumn 内第一个含 tweetText 且不是 reply 的 article
   const primary = document.querySelector(X_SELECTORS.primaryColumn);
   if (primary) {
@@ -217,24 +202,6 @@ export interface SelftestRow {
   found: boolean;
   count: number;
   selector: string;
-}
-
-export function runSelftest() {
-  const check = (selector: string): SelftestRow => {
-    const all = queryAll(selector);
-    return { found: all.length > 0, count: all.length, selector };
-  };
-  return {
-    tweetArticle: check(X_SELECTORS.tweet),
-    tweetText: check(X_SELECTORS.tweetText),
-    userName: check(X_SELECTORS.userName),
-    editor: check(X_SELECTORS.editor) || check(''),
-    replyButton: check(X_SELECTORS.replyButton),
-    likeButton: check(X_SELECTORS.like),
-    followButton: check(`${X_SELECTORS.follow}, ${X_SELECTORS.unfollow}`),
-    url: location.href,
-    checkedAt: Date.now(),
-  };
 }
 
 /** editor 选择器单独做多候选探测 */

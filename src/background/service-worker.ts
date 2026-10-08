@@ -24,6 +24,7 @@ import {
   getRuntime,
   getSettings,
   idleRuntime,
+  patchSettings,
   setRuntime,
 } from '../shared/storage';
 import type {
@@ -44,13 +45,18 @@ interface SwState {
   running: boolean;
   /** 当前任务所在标签页 */
   tabId: number | null;
-  /** 是否已在等待下一轮 */
-  cooling: boolean;
 }
 
-const state: SwState = { running: false, tabId: null, cooling: false };
+const state: SwState = { running: false, tabId: null };
 
-const pendingTimers = new Map<string, (value: void) => void>();
+/**
+ * 单轮循环的重入守卫。
+ *
+ * alarm 与冷启动兜底可能同时触发恢复；两者都在进入后、第一个 await 之前同步置位，
+ * 因此后到的那次会直接退出，不会并发跑两轮。
+ */
+let cycleInFlight = false;
+let resuming = false;
 
 /* ------------------------------------------------------------------ */
 /* 日志                                                                */
@@ -176,7 +182,8 @@ async function startAutomation(): Promise<Result<{ started: true }>> {
   }
 
   state.running = true;
-  state.cooling = false;
+  cycleInFlight = false;
+  resuming = false;
   await chrome.alarms.clear(ALARM_AUTO_TICK);
   await pushRuntime({
     phase: 'navigating',
@@ -186,6 +193,9 @@ async function startAutomation(): Promise<Result<{ started: true }>> {
     roundStartedAt: null,
     lastError: null,
   });
+  // automation.enabled 是配置里的「总开关」，此前只被 preflight 读过、
+  // 从没人写，导致它的值与真实运行状态永久脱节。
+  await patchSettings({ automation: { enabled: true } });
   await log('INFO', '自动巡航已启动');
 
   void runRoundCycle(0);
@@ -194,7 +204,6 @@ async function startAutomation(): Promise<Result<{ started: true }>> {
 
 async function stopAutomation(reason = '用户手动停止'): Promise<Result<{ stopped: true }>> {
   state.running = false;
-  state.cooling = false;
   await chrome.alarms.clear(ALARM_AUTO_TICK);
 
   // 广播制动，令 content script 立刻放弃当前动作
@@ -205,12 +214,24 @@ async function stopAutomation(reason = '用户手动停止'): Promise<Result<{ s
   }
 
   await pushRuntime({ phase: 'stopped', nextRoundAt: null });
+  await patchSettings({ automation: { enabled: false } });
   await log('WARNING', `紧急制动已触发：${reason}`);
   return { ok: true, data: { stopped: true } };
 }
 
 /** 单轮循环：执行 → 冷却 → 下一轮 */
 async function runRoundCycle(round: number): Promise<void> {
+  // 同步占位，早于任何 await —— alarm 与冷启动兜底并发恢复时后到者直接退出
+  if (cycleInFlight) return;
+  cycleInFlight = true;
+  try {
+    await executeRoundCycle(round);
+  } finally {
+    cycleInFlight = false;
+  }
+}
+
+async function executeRoundCycle(round: number): Promise<void> {
   if (!state.running) return;
 
   const settings = await getSettings();
@@ -301,59 +322,76 @@ async function runRoundCycle(round: number): Promise<void> {
   const sleepMs = Math.round((minM + Math.random() * Math.max(0, maxM - minM)) * 60_000);
   const wakeAt = Date.now() + sleepMs;
 
-  state.cooling = true;
   await pushRuntime({ phase: 'cooling', nextRoundAt: wakeAt });
   await log('WAIT', `进入冷却，将在 ${Math.round(sleepMs / 60000)} 分钟后开始第 ${round + 2} 轮`);
 
-  scheduleWake(wakeAt, () => {
-    void runRoundCycle(round + 1);
-  });
+  scheduleWake(wakeAt);
 }
 
 async function failRound(reason: string): Promise<void> {
   await log('ERROR', reason);
   await pushRuntime({ phase: 'error', lastError: reason, nextRoundAt: null });
   if (state.running) {
-    // 出错后等 2 分钟再试，而不是直接放弃
+    // 出错后等 2 分钟重试本轮，而不是直接放弃。
+    // 轮次号不从这里传：唤醒后由 resumeAfterWake() 从 storage 读回，
+    // 因为等到 alarm 真响时本 SW 实例多半已经被回收过了。
     const wakeAt = Date.now() + 120_000;
     await pushRuntime({ nextRoundAt: wakeAt });
-    scheduleWake(wakeAt, () => {
-      void runRoundCycle((0 as number) + (0 as number));
-    });
+    scheduleWake(wakeAt);
   }
 }
 
 /**
- * 跨轮次定时。chrome.alarms 最小周期为 30s，
- * 用一次性 alarm 承载长等待，同时在内存中保留一个回退 setTimeout
- * （SW 未休眠时精度更高）。
+ * 跨轮次定时：**只**用 chrome.alarms。
+ *
+ * alarms 是唯一能跨 SW 回收存活的计时器。早先这里还在内存 Map 里存了一份
+ * 唤醒回调、并对 60s 内的短等待加了一条 setTimeout 快路径 —— 但 MV3 的 SW
+ * 空闲约 30s 就被杀，而冷却动辄 15~30 分钟：等 alarm 真响时内存早已清空，
+ * 回调丢失，巡航跑完第一轮就静默停摆，侧边栏还停在过期的倒计时上。
+ *
+ * 因此唤醒意图一律落盘（phase + nextRoundAt），到点由 resumeAfterWake() 读回。
  */
-function scheduleWake(at: number, fn: () => void): void {
+function scheduleWake(at: number): void {
+  // Chrome 对 alarm 的最小提前量是 30s，更短会被静默抬高
   const delayMs = Math.max(30_000, at - Date.now());
-  const name = ALARM_AUTO_TICK;
-  pendingTimers.set(name, fn as () => void);
+  void chrome.alarms
+    .clear(ALARM_AUTO_TICK)
+    .then(() => chrome.alarms.create(ALARM_AUTO_TICK, { when: Date.now() + delayMs }));
+}
 
-  chrome.alarms.clear(name).then(() =>
-    chrome.alarms.create(name, { when: Date.now() + delayMs }),
-  );
+/**
+ * alarm 到点后的恢复：从 storage 读回运行意图，不依赖任何内存状态。
+ *
+ *  - phase === 'cooling' → 冷却结束，跑**下一轮**（runtime.round 是刚跑完的那轮）
+ *  - phase === 'error'   → 上次失败，**重试本轮**
+ *  - 其余（stopped / idle）→ 用户已主动停手，不动
+ */
+async function resumeAfterWake(): Promise<void> {
+  // alarm 事件与冷启动兜底会并发走到这里；resuming 在任何 await 之前同步置位，
+  // 保证恢复动作（含日志）只发生一次。
+  if (resuming || cycleInFlight) return;
+  resuming = true;
+  try {
+    const rt = await getRuntime();
+    if (!rt.nextRoundAt) return;
+    if (rt.phase !== 'cooling' && rt.phase !== 'error') return;
 
-  const localDelay = at - Date.now();
-  if (localDelay < 60_000) {
-    setTimeout(() => {
-      if (pendingTimers.has(name) && state.running) {
-        pendingTimers.delete(name);
-        void chrome.alarms.clear(name);
-        fn();
-      }
-    }, localDelay);
+    state.running = true;
+    state.tabId = (await findXTab())?.id ?? null;
+    const roundArg = rt.phase === 'error' ? Math.max(0, rt.round - 1) : rt.round;
+    await log(
+      'INFO',
+      rt.phase === 'error' ? `重试第 ${roundArg + 1} 轮` : `冷却结束，开始第 ${roundArg + 1} 轮`,
+    );
+    await runRoundCycle(roundArg);
+  } finally {
+    resuming = false;
   }
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== ALARM_AUTO_TICK) return;
-  const fn = pendingTimers.get(ALARM_AUTO_TICK);
-  pendingTimers.delete(ALARM_AUTO_TICK);
-  if (fn && state.running) fn();
+  void resumeAfterWake();
 });
 
 /* ------------------------------------------------------------------ */
@@ -640,14 +678,19 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 });
 
-// 首帧兜底：SW 冷启动时恢复一次状态
+// 首帧兜底：SW 冷启动时把中断的等待续上
 void (async () => {
   const rt = await getRuntime();
-  if (rt.phase === 'cooling' && rt.nextRoundAt && rt.nextRoundAt > Date.now()) {
-    // 页面刷新导致 SW 重启，续上之前的冷却计时
-    state.running = true;
-    state.cooling = true;
-    scheduleWake(rt.nextRoundAt, () => void runRoundCycle(rt.round));
+  if (rt.phase !== 'cooling' && rt.phase !== 'error') return;
+  if (!rt.nextRoundAt) return;
+
+  state.running = true;
+  if (rt.nextRoundAt > Date.now()) {
+    // 本次唤醒由别的事件触发（一条日志、一次面板调用），还没到点：重新挂上 alarm
+    scheduleWake(rt.nextRoundAt);
+  } else {
+    // 到点了却没跑起来 —— 本次唤醒大概率就是 alarm 触发的，续跑
+    void resumeAfterWake();
   }
 })();
 

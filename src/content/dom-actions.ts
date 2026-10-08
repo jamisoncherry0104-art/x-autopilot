@@ -10,7 +10,7 @@
 
 import { X_SELECTORS } from '../shared/constants';
 import { randomFloat, randomInt, sleep } from '../shared/utils';
-import { findEditor, findEditors, firstVisible, isVisible, queryAll, sortByVisibility } from './dom-extractor';
+import { findEditors, isVisible, queryAll, sortByVisibility } from './dom-extractor';
 import { interruptibleDelay, isHumanizerAborted, randomDelay, scrollIntoComfortZone, typingPause, chunkForTyping } from './humanizer';
 import { isProfilePathForPath, pickProfileButton } from './profile-probe';
 
@@ -407,43 +407,71 @@ export async function likeArticle(article: Element): Promise<'liked' | 'already'
  * 关注作者：优先使用推文内的关注按钮；
  * 时间线上的推文通常没有关注按钮，需要点进 Profile —— 这里只做前者，
  * 后者交给 service worker 决定是否值得跳转，避免打断巡航节奏。
+ *
+ * 返回值口径：`'already'` **只**在点击之前判定，即"根本没点"。
+ * 一旦点了就是 `'followed'`（状态翻转确认）或 `'failed'`（没能确认），
+ * 上层据此统计"实际点出去多少次关注"，作为配额的硬上限。
  */
 export async function followAuthor(article: Element): Promise<'followed' | 'already' | 'unavailable' | 'failed'> {
   if (article.querySelector(X_SELECTORS.unfollow)) return 'already';
 
-  let btn = article.querySelector<HTMLElement>(X_SELECTORS.follow);
-  if (!btn) {
-    // 悬停作者名时出现的快捷关注按钮
-    const handleLink = Array.from(article.querySelectorAll<HTMLAnchorElement>('a[href^="/"]')).find((a) =>
-      (a.textContent ?? '').trim().startsWith('@'),
-    );
-    if (handleLink) {
-      handleLink.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: 0, clientY: 0 }));
-      await randomDelay(200, 500);
-      btn = document.querySelector<HTMLElement>('[data-testid$="-follow"]');
-    }
-  }
+  const target = await locateFollowButton(article);
+  if (!target) return 'unavailable';
 
-  if (!btn) return 'unavailable';
-
-  // 先记住"关注前"的状态，点击后据此判断是否真的翻转了
-  const wasFollowing = needsShallowCheck(article);
-  const ok = await clickWithPause(btn, [600, 1600]);
+  const ok = await clickWithPause(target.btn, [600, 1600]);
   if (!ok) return 'failed';
   await randomDelay(600, 1400);
 
-  // 校验状态翻转：出现 unfollow 才算关注成功。
-  // 原实现写成 `? 'followed' : 'followed'`，等于无条件报成功，
-  // 会让上层日志显示"已关注"但实际没点上。
-  const nowFollowing = document.querySelector(X_SELECTORS.unfollow) !== null;
-  if (nowFollowing && !wasFollowing) return 'followed';
-  return nowFollowing ? 'already' : 'failed';
+  return confirmedFollowNear(target.btn, article) ? 'followed' : 'failed';
 }
 
-/** 关注前的状态探测（详情页关注按钮可能不在 article 内） */
-function needsShallowCheck(article: Element): boolean {
-  if (article.querySelector(X_SELECTORS.unfollow)) return true;
-  return document.querySelector(X_SELECTORS.unfollow) !== null;
+/**
+ * 定位这条推文对应的关注按钮。
+ *
+ * 时间线上的推文自身不带关注按钮，只有悬停作者名才会弹出快捷关注卡片。
+ * 卡片挂在 body 下的 portal 里，与推文块没有祖先关系，因此这里用
+ * 「悬停前后按钮集合的差集」来认它 —— 早先的实现是
+ * `document.querySelector('[data-testid$="-follow"]')` 全局取第一个，
+ * 而首页右栏「推荐关注」区块里全是同款按钮，等于随手关注一个陌生人。
+ */
+async function locateFollowButton(article: Element): Promise<{ btn: HTMLElement } | null> {
+  const inline = article.querySelector<HTMLElement>(X_SELECTORS.follow);
+  if (inline && isVisible(inline)) return { btn: inline };
+
+  const handleLink = Array.from(article.querySelectorAll<HTMLAnchorElement>('a[href^="/"]')).find((a) =>
+    (a.textContent ?? '').trim().startsWith('@'),
+  );
+  if (!handleLink) return null;
+
+  const before = new Set(queryAll<HTMLElement>(X_SELECTORS.follow));
+  handleLink.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: 0, clientY: 0 }));
+  await randomDelay(200, 500);
+
+  const fresh = queryAll<HTMLElement>(X_SELECTORS.follow).find((b) => !before.has(b) && isVisible(b));
+  return fresh ? { btn: fresh } : null;
+}
+
+/**
+ * 点击后确认关注是否生效。
+ *
+ * 只在这颗按钮自己的子树里找 unfollow：
+ *  - 按钮在推文块内 → 就查推文块；
+ *  - 按钮在悬停卡片（body 下的 portal）里 → 查到卡片根为止。
+ *
+ * 早先这里是 `document.querySelector(unfollow)` 全局探测。x.com/home 的
+ * 右栏推荐区常驻 unfollow 按钮，于是 wasFollowing 几乎恒为真：
+ * 关注成功也被报成 'already'，outcome.follows 永不增长、配额永远填不满，
+ * 循环会一直关注下去，远超 followQuotaPerRound。
+ */
+function confirmedFollowNear(btn: HTMLElement, article: Element): boolean {
+  if (article.contains(btn)) {
+    return article.querySelector(X_SELECTORS.unfollow) !== null;
+  }
+  let node: Element | null = btn;
+  while (node && node.parentElement && node.parentElement !== document.body) {
+    node = node.parentElement;
+  }
+  return (node ?? btn).querySelector(X_SELECTORS.unfollow) !== null;
 }
 
 /**
@@ -477,8 +505,9 @@ export async function followAuthorOnDetailPage(): Promise<'followed' | 'already'
   const ok = await clickWithPause(btn, [600, 1600]);
   if (!ok) return 'failed';
   await randomDelay(500, 1200);
-  // 校验状态翻转：点完应出现 unfollow
-  return document.querySelector(X_SELECTORS.unfollow) ? 'followed' : 'failed';
+  // 校验状态翻转：点完应在主栏内出现 unfollow。
+  // 只在 primary 里找 —— 全局探测会被右栏推荐区的常驻按钮骗过去。
+  return primary.querySelector(X_SELECTORS.unfollow) ? 'followed' : 'failed';
 }
 
 /* ------------------------------------------------------------------ */
@@ -651,5 +680,3 @@ export async function goBackToTimeline(): Promise<boolean> {
   }
   return false;
 }
-
-export { queryAll, firstVisible, isVisible, findEditor };

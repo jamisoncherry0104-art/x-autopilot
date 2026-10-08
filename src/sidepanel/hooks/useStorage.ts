@@ -11,7 +11,6 @@ import {
   getRuntime,
   getSettings,
   patchSettings as patchSettingsStorage,
-  resolveTheme,
   subscribeLogs,
   subscribeRuntime,
   subscribeSettings,
@@ -98,8 +97,14 @@ export function useSettings(): SettingsStore {
   useEffect(() => {
     if (!settings) return;
     applyTheme(settings.theme);
-    void resolveTheme(settings.theme);
   }, [settings]);
+
+  // 卸载时清掉"已保存"闪现的定时器，避免对已卸载组件 setState
+  useEffect(() => {
+    return () => {
+      if (savingTimer.current) window.clearTimeout(savingTimer.current);
+    };
+  }, []);
 
   return { settings, loading, saving, update, replace, reload };
 }

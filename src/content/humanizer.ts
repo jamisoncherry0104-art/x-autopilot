@@ -14,11 +14,6 @@ export function randomDelay(minMs: number, maxMs: number): Promise<void> {
   return sleep(randomFloat(Math.min(minMs, maxMs), Math.max(minMs, maxMs)));
 }
 
-/** 秒区间便捷写法 */
-export function randomDelaySec(range: [number, number]): Promise<void> {
-  return randomDelay(range[0] * 1000, range[1] * 1000);
-}
-
 /* ------------------------------------------------------------------ */
 /* 三次贝塞尔缓动                                                      */
 /* ------------------------------------------------------------------ */
@@ -142,17 +137,35 @@ export async function typingPause(chunk: string, baseSpeedMs = 28): Promise<void
 }
 
 /* ------------------------------------------------------------------ */
-/* 行为门控：全局开关，紧急制动时立即打断所有延时                      */
+/* 行为门控：紧急制动                                                    */
 /* ------------------------------------------------------------------ */
 
-let abortFlag = false;
+/**
+ * 制动标记只对**自动轮次**生效。
+ *
+ * 早先只有一个 abortFlag，且只在下一轮 CS_AUTO_ROUND 开头才复位。于是按过
+ * 一次紧急制动之后（哪怕当时根本没有轮次在跑，比如只是冷却中），
+ * 手动模式的「仅填入 / 填入并发送」会因为 typewriterInto 里的检查而永久失败，
+ * 还回一句误导性的「请手动点击评论框后重试」—— 只能刷新页面才能恢复。
+ *
+ * 因此把「是否有自动轮次在飞」单独记一份：制动是终止巡航的手段，
+ * 不是把整个 content script 打进死状态的开关。
+ */
+let abortRequested = false;
+let autoRoundInFlight = false;
 
 export function setHumanizerAborted(v: boolean): void {
-  abortFlag = v;
+  abortRequested = v;
+}
+
+/** 由 CS_AUTO_ROUND 的起止调用；轮次收尾时顺带清掉遗留的制动请求 */
+export function setAutoRoundInFlight(v: boolean): void {
+  autoRoundInFlight = v;
+  if (!v) abortRequested = false;
 }
 
 export function isHumanizerAborted(): boolean {
-  return abortFlag;
+  return abortRequested && autoRoundInFlight;
 }
 
 /** 可被紧急制动打断的延时 */
@@ -160,9 +173,9 @@ export async function interruptibleDelay(ms: number): Promise<boolean> {
   const step = 120;
   let elapsed = 0;
   while (elapsed < ms) {
-    if (abortFlag) return false;
+    if (isHumanizerAborted()) return false;
     await sleep(Math.min(step, ms - elapsed));
     elapsed += step;
   }
-  return !abortFlag;
+  return !isHumanizerAborted();
 }

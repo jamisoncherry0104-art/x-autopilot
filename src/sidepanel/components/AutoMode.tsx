@@ -267,7 +267,7 @@ export default function AutoMode({ settings, update, runtime, logs, onClearLogs,
           label="自动提交评论"
           hint="关闭时只把评论填入草稿框，由你人工确认后发送（推荐首次使用时关闭）"
           checked={a.autoSubmitComment}
-          onChange={(v) => set({ autoSubmitComment: v, enabled: v || a.enabled })}
+          onChange={(v) => set({ autoSubmitComment: v })}
         />
       </Card>
 
