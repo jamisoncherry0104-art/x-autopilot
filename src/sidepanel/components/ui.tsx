@@ -1,7 +1,7 @@
 /** 共用 UI 原子组件：保持面板代码聚焦在业务逻辑上 */
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Check, ChevronDown, Loader2, Minus, Plus, RefreshCw } from 'lucide-react';
+import { Check, ChevronDown, Loader2, RefreshCw } from 'lucide-react';
 import { cn } from '../../shared/utils';
 
 /* ------------------------------------------------------------------ */
@@ -217,64 +217,6 @@ export function Switch({
           )}
         />
       </button>
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-
-export function NumberStepper({
-  value,
-  onChange,
-  min = 0,
-  max = 999,
-  step = 1,
-  suffix,
-  label,
-  hint,
-}: {
-  value: number;
-  onChange: (v: number) => void;
-  min?: number;
-  max?: number;
-  step?: number;
-  suffix?: string;
-  label: string;
-  hint?: string;
-}) {
-  const set = (v: number) => onChange(Math.min(max, Math.max(min, Math.round(v))));
-  return (
-    <div className="mb-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-[12px] font-medium leading-tight">{label}</div>
-          {hint && <p className="mt-0.5 text-[10.5px] leading-snug text-ink-400">{hint}</p>}
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          <button
-            type="button"
-            className="xa-btn-ghost !px-1.5 !py-1"
-            onClick={() => set(value - step)}
-            aria-label={`减少 ${label}`}
-            disabled={value <= min}
-          >
-            <Minus size={12} />
-          </button>
-          <span className="min-w-[52px] text-center font-mono text-[12px] tabular-nums">
-            {value}
-            {suffix && <span className="ml-0.5 text-[10px] text-ink-400">{suffix}</span>}
-          </span>
-          <button
-            type="button"
-            className="xa-btn-ghost !px-1.5 !py-1"
-            onClick={() => set(value + step)}
-            aria-label={`增加 ${label}`}
-            disabled={value >= max}
-          >
-            <Plus size={12} />
-          </button>
-        </div>
-      </div>
     </div>
   );
 }
