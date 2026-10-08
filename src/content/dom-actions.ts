@@ -576,14 +576,6 @@ function permalinkOf(article: Element): HTMLAnchorElement | null {
  * 点击后**轮询确认 URL 已切换且主推文已渲染**，避免"点了但 SPA 还没渲染完"
  * 就继续下一步（这会让后续的编辑器定位落到旧页面上）。
  *
- * @returns 详情页永久链接；未能进入返回 null
- */
-/**
- * 点进目标推文的详情页，并等到详情页真正就绪。
- *
- * 点击后**轮询确认 URL 已切换且主推文已渲染**，避免"点了但 SPA 还没渲染完"
- * 就继续下一步（这会让后续的编辑器定位落到旧页面上）。
- *
  * 注意：这里刻意**不做 `location.assign` 这类硬导航兜底** ——
  * 硬导航会卸载 content script，正在执行的 `CS_AUTO_ROUND` 通道随之断开，
  * service worker 会收到一个无意义的错误。X 的时间戳链接是标准 SPA 路由，
@@ -600,10 +592,12 @@ export async function enterDetailPage(article: Element): Promise<string | null> 
   const targetPath = href.split('?')[0].split('#')[0];
 
   await clickWithPause(link, [600, 1400]);
+  if (isHumanizerAborted()) return null;
 
   // 等 URL 切换 + 主推文正文渲染（两者都满足才算就绪）
   const deadline = Date.now() + 8000;
   while (Date.now() < deadline) {
+    if (isHumanizerAborted()) return null;
     if (location.pathname.startsWith(targetPath) && document.querySelector(X_SELECTORS.tweetText)) {
       await randomDelay(400, 1000);
       return `${location.origin}${targetPath}`;
@@ -672,6 +666,7 @@ export async function goBackToTimeline(): Promise<boolean> {
   // 等到离开详情页（不再是 /status/ 路径）
   const deadline = Date.now() + 6000;
   while (Date.now() < deadline) {
+    if (isHumanizerAborted()) return false;
     if (!/^\/[^/]+\/status\/\d+/.test(location.pathname)) {
       await randomDelay(400, 1000);
       return true;

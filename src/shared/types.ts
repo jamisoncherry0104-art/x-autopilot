@@ -102,8 +102,6 @@ export interface ManualAutoConfig {
   autoGenerate: boolean;
   /** 抓取后自动关注该推文作者 */
   autoFollow: boolean;
-  /** 自动关注时若已关注则跳过（关闭则不做任何处理） */
-  followSkipIfFollowing: boolean;
 }
 
 export interface AutomationConfig {
@@ -175,22 +173,35 @@ export interface AppSettings {
 /* 运行态                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 巡航阶段。
+ *
+ * 这里只保留 SW 真正会写入的值。一整轮 CS_AUTO_ROUND 是一次
+ * request/response，点赞/评论/关注都发生在 content script 内部，
+ * SW 无法在轮次中途细化阶段 —— 早先前挑选 / 点赞 / 评论 / 关注四个值
+ * 声明了却从未被发出过，只会让读代码的人以为存在细粒度进度。
+ */
 export type AutomationPhase =
   | 'idle'
   | 'navigating'
   | 'scrolling'
-  | 'picking'
-  | 'liking'
-  | 'commenting'
-  | 'following'
   | 'cooling'
   | 'stopped'
   | 'error';
 
 export interface RoundCounters {
   likes: number;
+  /** 真正发送出去的评论数（草稿模式恒为 0） */
   comments: number;
   follows: number;
+  /**
+   * 只填入编辑器、未发送的评论草稿数。
+   *
+   * autoSubmitComment 关闭时走这条：草稿会在返回时间线时被销毁，
+   * 所以它**不计入评论配额** —— 早先把草稿也算进 comments，
+   * UI 显示「评论 2/2」而实际一条都没发出去。
+   */
+  drafts: number;
   /** 已浏览推文数 */
   scanned: number;
   /** 指纹去重集合（保留最近 400 条） */
@@ -316,6 +327,8 @@ export interface UiTestLlmMsg {
 export interface UiGenerateMsg {
   type: 'LLM_GENERATE';
   snapshot: TweetSnapshot;
+  /** 详情页主推文上方的上下文推文，渲染进 {tweet_context} */
+  ancestors?: TweetSnapshot[];
 }
 export interface UiClearLogsMsg {
   type: 'LOGS_CLEAR';

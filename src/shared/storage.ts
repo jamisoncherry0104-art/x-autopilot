@@ -143,6 +143,19 @@ export function preflight(settings: AppSettings): PreflightIssue[] {
       severity: 'warn',
     });
   }
+  /*
+   * {tweet_context} 是后加的变量。老用户存储里的模板是旧版默认值，
+   * mergeSettings 只会用默认值补「缺失的键」，不会重写已存在的模板字符串，
+   * 所以他们的详情页上文依然不会进入模型。
+   * 这里显式提醒，避免他们以为 UI 上的「上文 N 条（作为生成上下文）」已经生效。
+   */
+  if (!mergedTemplate.includes('{tweet_context}')) {
+    issues.push({
+      field: 'prompt.templates',
+      message: '提示词模板缺少 {tweet_context}，详情页上文不会进入模型；在模板里加一行该变量即可启用',
+      severity: 'warn',
+    });
+  }
   if (settings.automation.enabled) {
     const a = settings.automation;
     if (a.likeQuotaPerRound + a.commentQuotaPerRound + a.followQuotaPerRound === 0) {
@@ -166,7 +179,7 @@ export function idleRuntime(): AutomationRuntime {
     round: 0,
     roundStartedAt: null,
     nextRoundAt: null,
-    counters: { likes: 0, comments: 0, follows: 0, scanned: 0, seen: [] },
+    counters: { likes: 0, comments: 0, follows: 0, drafts: 0, scanned: 0, seen: [] },
     lastError: null,
   };
 }

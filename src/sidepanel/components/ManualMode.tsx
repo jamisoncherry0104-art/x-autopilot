@@ -135,6 +135,8 @@ export default function ManualMode({ settings, update, logs, onToast }: Props) {
         const res = await callBackground<{ text: string }>({
           type: 'LLM_GENERATE',
           snapshot: target.main,
+          // 卡片上显示的「上文 N 条（作为生成上下文）」到这里才真的进入 prompt
+          ancestors: target.ancestors,
         });
         setDraft(res.text);
 

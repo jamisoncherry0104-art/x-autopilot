@@ -457,7 +457,7 @@ export default function SettingsModal({ settings, update, replace, onToast }: Pr
           <Card>
             <SectionTitle
               title="模板变量"
-              hint="可用变量：{tweet_text} {tweet_author} {tweet_handle} {persona} {max_chars} {lang_rule}"
+              hint="可用变量：{tweet_text} {tweet_author} {tweet_handle} {tweet_context} {persona} {max_chars} {lang_rule}"
             />
             {unknownVars.length > 0 && (
               <p className="rounded-lg bg-warn/10 px-2.5 py-2 text-[11px] leading-snug text-warn">

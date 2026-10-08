@@ -173,7 +173,14 @@ async function sendToTab<T>(tabId: number, message: unknown): Promise<Result<T>>
 /* 轮次调度                                                            */
 /* ------------------------------------------------------------------ */
 
-const countersSnapshot = (): RoundCounters => ({ likes: 0, comments: 0, follows: 0, scanned: 0, seen: [] });
+const countersSnapshot = (): RoundCounters => ({
+  likes: 0,
+  comments: 0,
+  follows: 0,
+  drafts: 0,
+  scanned: 0,
+  seen: [],
+});
 
 async function startAutomation(): Promise<Result<{ started: true }>> {
   const settings = await getSettings();
@@ -271,6 +278,7 @@ async function executeRoundCycle(round: number): Promise<void> {
     likes: number;
     comments: number;
     follows: number;
+    drafts: number;
     scanned: number;
     seen: string[];
     aborted: boolean;
@@ -306,6 +314,7 @@ async function executeRoundCycle(round: number): Promise<void> {
       likes: outcome.likes,
       comments: outcome.comments,
       follows: outcome.follows,
+      drafts: outcome.drafts,
       scanned: outcome.scanned,
       seen: outcome.seen,
     },
@@ -313,7 +322,8 @@ async function executeRoundCycle(round: number): Promise<void> {
 
   await log(
     'DONE',
-    `第 ${round + 1} 轮结束｜赞 ${outcome.likes}・评 ${outcome.comments}・关注 ${outcome.follows}｜浏览 ${outcome.scanned} 条`,
+    `第 ${round + 1} 轮结束｜赞 ${outcome.likes}・评 ${outcome.comments}・关注 ${outcome.follows}` +
+      `${outcome.drafts > 0 ? `・草稿 ${outcome.drafts}` : ''}｜浏览 ${outcome.scanned} 条`,
   );
   if (outcome.error) await log('ERROR', `轮次内异常：${outcome.error}`);
 
@@ -454,12 +464,16 @@ function proxyContext(): ApiContext {
   return createContext(swTransport);
 }
 
-async function proxyGenerate(snapshot: TweetSnapshot): Promise<Result<{ text: string }>> {
+async function proxyGenerate(
+  snapshot: TweetSnapshot,
+  ancestors: TweetSnapshot[] = [],
+): Promise<Result<{ text: string }>> {
   const settings = await getSettings();
   try {
     const text = await generateComment({
       ctx: proxyContext(),
       snapshot,
+      ancestors,
       llm: settings.llm,
       prompt: settings.prompt,
     });
@@ -587,8 +601,8 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
 
   // ---- content script -> SW：生成评论 ----
   if (msg.type === 'SW_GENERATE_FOR') {
-    const m = message as { snapshot: TweetSnapshot };
-    proxyGenerate(m.snapshot)
+    const m = message as { snapshot: TweetSnapshot; ancestors?: TweetSnapshot[] };
+    proxyGenerate(m.snapshot, m.ancestors)
       .then((r) => {
         if (!r.ok) void log('ERROR', `LLM 调用失败：${r.error}`);
         sendResponse(r);
@@ -613,11 +627,13 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
     case 'AUTO_STATE_SYNC':
       sendResponse(ok({ running: state.running, tabId: state.tabId }));
       return false;
-    case 'LLM_GENERATE':
-      proxyGenerate((message as { snapshot: TweetSnapshot }).snapshot)
+    case 'LLM_GENERATE': {
+      const m = message as { snapshot: TweetSnapshot; ancestors?: TweetSnapshot[] };
+      proxyGenerate(m.snapshot, m.ancestors)
         .then(sendResponse)
         .catch((e: Error) => sendResponse(fail(e.message)));
       return true;
+    }
     case 'LLM_TEST': {
       void (async () => {
         const settings = await getSettings();

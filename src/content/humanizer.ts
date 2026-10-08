@@ -9,9 +9,16 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, Math.max(0, Math.round(ms))));
 }
 
-/** [minMs, maxMs] 随机延时 */
-export function randomDelay(minMs: number, maxMs: number): Promise<void> {
-  return sleep(randomFloat(Math.min(minMs, maxMs), Math.max(minMs, maxMs)));
+/**
+ * [minMs, maxMs] 随机延时。
+ *
+ * 走 interruptibleDelay 而非裸 sleep：紧急制动按下后，最长的等待（browseBurst
+ * 里的 600~2200ms 连乘）必须能在 ~120ms 内让出，否则制动请求要等好几秒才生效。
+ * 所有调用点因此自动继承可打断行为，无需各自加检查。
+ * 手动模式下 autoRoundInFlight 为 false，isHumanizerAborted() 恒为 false，行为不变。
+ */
+export async function randomDelay(minMs: number, maxMs: number): Promise<void> {
+  await interruptibleDelay(randomFloat(Math.min(minMs, maxMs), Math.max(minMs, maxMs)));
 }
 
 /* ------------------------------------------------------------------ */

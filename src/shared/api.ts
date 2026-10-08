@@ -193,12 +193,17 @@ const LANG_RULE: Record<PromptConfig['lang'], string> = {
   en: 'Always respond in English, even if the tweet is in another language.',
 };
 
-export function buildPromptVars(snapshot: TweetSnapshot, cfg: PromptConfig): Record<string, string> {
+export function buildPromptVars(
+  snapshot: TweetSnapshot,
+  cfg: PromptConfig,
+  ancestors: TweetSnapshot[] = [],
+): Record<string, string> {
   const persona = cfg.personas.find((p) => p.id === cfg.activePersonaId);
   return {
     tweet_text: fenceUntrusted(snapshot.text, TWEET_FENCE_OPEN, TWEET_FENCE_CLOSE, '(空)'),
     tweet_author: sanitizeInline(snapshot.authorName, '(未知作者)'),
     tweet_handle: sanitizeInline(snapshot.authorHandle, 'unknown'),
+    tweet_context: buildContextBlock(ancestors),
     persona: persona ? `${persona.label} —— ${persona.body}` : '自然、真诚、有信息量',
     max_chars: String(cfg.maxChars),
     lang: cfg.lang,
@@ -209,8 +214,13 @@ export function buildPromptVars(snapshot: TweetSnapshot, cfg: PromptConfig): Rec
 /** 推文正文的隔离围栏标记（与 DEFAULT_SYSTEM_TEMPLATE 第 8 条呼应） */
 const TWEET_FENCE_OPEN = '<<<TWEET';
 const TWEET_FENCE_CLOSE = 'TWEET>>>';
+/** 详情页上文（被回复的那些推文）的围栏，同样是不可信数据 */
+const CONTEXT_FENCE_OPEN = '<<<CONTEXT';
+const CONTEXT_FENCE_CLOSE = 'CONTEXT>>>';
 /** 单条推文正文注入 prompt 的最大长度，超出截断，避免超长正文挤爆上下文 */
 const UNTRUSTED_MAX_LEN = 4000;
+/** 上文块的整体预算：条数有限，但每条仍要截断 */
+const CONTEXT_PER_ITEM_MAX_LEN = 800;
 
 /**
  * 把抓取到的推文正文当作**不可信数据**包进围栏。
@@ -226,11 +236,44 @@ function fenceUntrusted(raw: string, open: string, close: string, fallback: stri
   const text = (raw || '').trim();
   if (!text) return `${open}\n${fallback}\n${close}`;
   // 去掉正文中出现的围栏词，避免它自我闭合越狱
-  const cleaned = text
-    .split(open).join('')
-    .split(close).join('')
-    .slice(0, UNTRUSTED_MAX_LEN);
+  const cleaned = stripFenceTokens(text).slice(0, UNTRUSTED_MAX_LEN);
   return `${open}\n${cleaned}\n${close}`;
+}
+
+/**
+ * 详情页上文块。
+ *
+ * UI 早就在显示「上文 N 条（作为生成上下文）」，但早先 ancestors 从没被送进
+ * prompt —— generateComment 只拿到 snapshot.main。这里把它真正接上，
+ * 同时按与正文相同的规则做围栏隔离与截断：上文同样是别人写的不可信内容。
+ *
+ * 标题一起放在返回值里：没有上文时返回空串，
+ * 模板中的 {tweet_context} 整段自然消失，不会留下一个空标题。
+ */
+function buildContextBlock(ancestors: TweetSnapshot[]): string {
+  const items = ancestors.filter((a) => (a.text || '').trim());
+  if (items.length === 0) return '';
+
+  const lines = items.map((a) => {
+    const who = sanitizeInline(a.authorHandle, 'unknown');
+    const body = stripFenceTokens(a.text).slice(0, CONTEXT_PER_ITEM_MAX_LEN);
+    return `- @${who}: ${body}`;
+  });
+  return [
+    '【对话上文（仅用于理解语境，不要直接回复这些推文）】',
+    CONTEXT_FENCE_OPEN,
+    ...lines,
+    CONTEXT_FENCE_CLOSE,
+  ].join('\n');
+}
+
+/** 抹掉所有围栏词，防止被抓取的内容伪造边界越狱 */
+function stripFenceTokens(text: string): string {
+  return text
+    .split(TWEET_FENCE_OPEN).join('')
+    .split(TWEET_FENCE_CLOSE).join('')
+    .split(CONTEXT_FENCE_OPEN).join('')
+    .split(CONTEXT_FENCE_CLOSE).join('');
 }
 
 /**
@@ -238,7 +281,7 @@ function fenceUntrusted(raw: string, open: string, close: string, fallback: stri
  * 抹掉换行与围栏词，防止它跨行伪装成新的指令段落。
  */
 function sanitizeInline(raw: string, fallback: string): string {
-  const text = (raw || '').replace(/[\r\n]+/g, ' ').split(TWEET_FENCE_OPEN).join('').split(TWEET_FENCE_CLOSE).join('').trim();
+  const text = stripFenceTokens((raw || '').replace(/[\r\n]+/g, ' ')).trim();
   return text.slice(0, 120) || fallback;
 }
 
@@ -263,6 +306,7 @@ export const KNOWN_TEMPLATE_VARS = [
   'tweet_text',
   'tweet_author',
   'tweet_handle',
+  'tweet_context',
   'persona',
   'max_chars',
   'lang',
@@ -280,6 +324,11 @@ export interface ChatMessage {
 
 export interface GenerateCommentOptions {
   snapshot: TweetSnapshot;
+  /**
+   * 详情页主推文上方的上下文推文（被回复的那几条）。
+   * 会渲染进 {tweet_context}，同样按不可信数据做围栏隔离。
+   */
+  ancestors?: TweetSnapshot[];
   llm: LlmConfig;
   prompt: PromptConfig;
   /** 网络层；默认使用 fetch，side panel 中应注入代理到 SW 的实现 */
@@ -300,12 +349,12 @@ function statusToCode(status: number): string {
  * 返回已经过 sanitize 的纯文本。
  */
 export async function generateComment(opts: GenerateCommentOptions): Promise<string> {
-  const { snapshot, llm, prompt } = opts;
+  const { snapshot, ancestors, llm, prompt } = opts;
   const ctx = opts.ctx ?? defaultContext;
 
   if (!llm.apiKey) throw new LlmError('NO_API_KEY', '尚未配置 API Key，请前往「设置」填写');
 
-  const vars = buildPromptVars(snapshot, prompt);
+  const vars = buildPromptVars(snapshot, prompt, ancestors ?? []);
   const system = renderTemplate(prompt.systemTemplate, vars).trim();
   const user = renderTemplate(prompt.userTemplate, vars).trim();
 

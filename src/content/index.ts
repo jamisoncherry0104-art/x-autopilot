@@ -178,6 +178,7 @@ export interface RoundOutcome {
   likes: number;
   comments: number;
   follows: number;
+  drafts: number;
   scanned: number;
   seen: string[];
   aborted: boolean;
@@ -189,6 +190,7 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
     likes: 0,
     comments: 0,
     follows: 0,
+    drafts: 0,
     scanned: 0,
     seen: [...payload.seen],
     aborted: false,
@@ -361,19 +363,26 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
             const readingOk = await readingDwell(payload.readDwellMs);
             if (readingOk) {
               swLog('ACTION', `已进入详情页 @${detail.main.authorHandle}，请求 AI 生成评论…`);
-              const gen = await sendToSw<{ text: string }>({ type: 'SW_GENERATE_FOR', snapshot: detail.main });
+              const gen = await sendToSw<{ text: string }>({
+                type: 'SW_GENERATE_FOR',
+                snapshot: detail.main,
+                // 上文真的传给模型 —— 早先只传 main，UI 那句「作为生成上下文」是空的
+                ancestors: detail.ancestors,
+              });
 
               if (!gen.ok) {
                 swLog('ERROR', `评论生成失败：${gen.error}`);
               } else {
                 const comment = await postCommentOnDetailPage(gen.data.text, payload.autoSubmitComment);
-                if (comment.ok) {
+                if (comment.ok && comment.submitted) {
                   outcome.comments += 1;
+                  swLog('ACTION', `评论已提交（${outcome.comments}/${payload.commentQuota}）：${gen.data.text.slice(0, 30)}…`);
+                } else if (comment.ok) {
+                  // 草稿模式：返回时间线时这个草稿就被销毁了，不能算作完成一次评论
+                  outcome.drafts += 1;
                   swLog(
                     'ACTION',
-                    comment.submitted
-                      ? `评论已提交（${outcome.comments}/${payload.commentQuota}）：${gen.data.text.slice(0, 30)}…`
-                      : `已填入草稿未发送（${outcome.comments}/${payload.commentQuota}）：${gen.data.text.slice(0, 30)}…`,
+                    `已填入草稿未发送（本轮第 ${outcome.drafts} 条，评论配额仍为 ${outcome.comments}/${payload.commentQuota}）：${gen.data.text.slice(0, 30)}…`,
                   );
                 } else {
                   swLog('WARNING', comment.reason ?? '评论写入失败，跳过该条');
@@ -404,6 +413,15 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
     swLog(
       'WARNING',
       `本轮共点击关注 ${followClicks} 次，仅确认成功 ${outcome.follows} 次；已按点击数封顶，不再继续关注`,
+    );
+  }
+
+  if (!payload.autoSubmitComment && outcome.drafts > 0 && outcome.comments < payload.commentQuota) {
+    swLog(
+      'WARNING',
+      `「自动提交评论」处于关闭状态：本轮填入 ${outcome.drafts} 条草稿（返回时间线后即被丢弃），` +
+        `实际发送 ${outcome.comments}/${payload.commentQuota}。` +
+        `草稿模式不会填满评论配额，需要真正发帖请在设置里打开自动提交。`,
     );
   }
 
