@@ -46,9 +46,11 @@ interface SwState {
   tabId: number | null;
   /** 是否已在等待下一轮 */
   cooling: boolean;
+  /** 最后一次启动的轮机编号（用于出错后的重试，避免从第 0 轮重新计数） */
+  round: number;
 }
 
-const state: SwState = { running: false, tabId: null, cooling: false };
+const state: SwState = { running: false, tabId: null, cooling: false, round: 0 };
 
 const pendingTimers = new Map<string, (value: void) => void>();
 
@@ -170,6 +172,10 @@ async function sendToTab<T>(tabId: number, message: unknown): Promise<Result<T>>
 const countersSnapshot = (): RoundCounters => ({ likes: 0, comments: 0, follows: 0, scanned: 0, seen: [] });
 
 async function startAutomation(): Promise<Result<{ started: true }>> {
+  // 守卫：已在运行时不重复启动，避免并发多条轮机循环导致配额翻倍
+  if (state.running || state.cooling) {
+    return fail('自动巡航已在运行中，请先停止再重新启动');
+  }
   const settings = await getSettings();
   if (!settings.llm.apiKey && settings.automation.commentQuotaPerRound > 0) {
     await log('WARNING', '未配置 API Key，本轮将只执行点赞/关注，跳过评论');
@@ -177,6 +183,7 @@ async function startAutomation(): Promise<Result<{ started: true }>> {
 
   state.running = true;
   state.cooling = false;
+  state.round = 0;
   await chrome.alarms.clear(ALARM_AUTO_TICK);
   await pushRuntime({
     phase: 'navigating',
@@ -213,6 +220,7 @@ async function stopAutomation(reason = '用户手动停止'): Promise<Result<{ s
 async function runRoundCycle(round: number): Promise<void> {
   if (!state.running) return;
 
+  state.round = round;
   const settings = await getSettings();
   const a = settings.automation;
 
@@ -318,7 +326,7 @@ async function failRound(reason: string): Promise<void> {
     const wakeAt = Date.now() + 120_000;
     await pushRuntime({ nextRoundAt: wakeAt });
     scheduleWake(wakeAt, () => {
-      void runRoundCycle((0 as number) + (0 as number));
+      void runRoundCycle(state.round);
     });
   }
 }

@@ -161,35 +161,6 @@ export function useRuntime(): RuntimeStore {
 
 /* ------------------------------------------------------------------ */
 
-/** 当前激活标签页的 URL，用于判断是否处于推文详情页 */
-export function useActiveTabUrl(pollMs = 1200): string | null {
-  const [url, setUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-
-    const probe = async () => {
-      try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (alive) setUrl(tab?.url ?? null);
-      } catch {
-        if (alive) setUrl(null);
-      }
-    };
-
-    void probe();
-    const timer = window.setInterval(probe, pollMs);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
-  }, [pollMs]);
-
-  return url;
-}
-
-/* ------------------------------------------------------------------ */
-
 /** 倒计时：给定目标时间戳，返回剩余毫秒 */
 export function useCountdown(target: number | null): number {
   const [left, setLeft] = useState(() => (target ? Math.max(0, target - Date.now()) : 0));

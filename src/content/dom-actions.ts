@@ -420,7 +420,11 @@ export async function followAuthor(article: Element): Promise<'followed' | 'alre
     if (handleLink) {
       handleLink.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: 0, clientY: 0 }));
       await randomDelay(200, 500);
-      btn = document.querySelector<HTMLElement>('[data-testid$="-follow"]');
+      // 悬停浮层可能渲染在 article 之外，但不能命中侧边栏的无关关注按钮
+      btn =
+        Array.from(document.querySelectorAll<HTMLElement>('[data-testid$="-follow"]')).find(
+          (b) => !b.closest('[data-testid="sidebarColumn"]'),
+        ) ?? null;
     }
   }
 

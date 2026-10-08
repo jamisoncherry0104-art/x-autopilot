@@ -306,7 +306,13 @@ export interface SwToContentMsg {
   payload: ToContentMessage;
 }
 
-export type ToBackgroundMessage = SwLogMsg | SwNavigateMsg | SwGetTabMsg | SwSleepMsg | SwToContentMsg;
+/** content script 在详情页生成评论时，携带推文快照请 SW 代理调用 LLM */
+export interface SwGenerateForMsg {
+  type: 'SW_GENERATE_FOR';
+  snapshot: TweetSnapshot;
+}
+
+export type ToBackgroundMessage = SwLogMsg | SwNavigateMsg | SwGetTabMsg | SwSleepMsg | SwToContentMsg | SwGenerateForMsg;
 
 /* --- UI <-> Background 控制面 --- */
 export interface UiStartAutoMsg {

@@ -219,24 +219,6 @@ export interface SelftestRow {
   selector: string;
 }
 
-export function runSelftest() {
-  const check = (selector: string): SelftestRow => {
-    const all = queryAll(selector);
-    return { found: all.length > 0, count: all.length, selector };
-  };
-  return {
-    tweetArticle: check(X_SELECTORS.tweet),
-    tweetText: check(X_SELECTORS.tweetText),
-    userName: check(X_SELECTORS.userName),
-    editor: check(X_SELECTORS.editor) || check(''),
-    replyButton: check(X_SELECTORS.replyButton),
-    likeButton: check(X_SELECTORS.like),
-    followButton: check(`${X_SELECTORS.follow}, ${X_SELECTORS.unfollow}`),
-    url: location.href,
-    checkedAt: Date.now(),
-  };
-}
-
 /** editor 选择器单独做多候选探测 */
 export function findEditor(): HTMLElement | null {
   const candidates = [X_SELECTORS.editor, X_SELECTORS.editorFallback, 'div[contenteditable="true"][role="textbox"]'];
