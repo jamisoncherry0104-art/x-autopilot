@@ -143,7 +143,7 @@ export const DEFAULT_MANUAL_AUTO: ManualAutoConfig = {
  */
 export const DEFAULT_PROFILE_CARD: ProfileCardConfig = {
   enabled: true,
-  handle: '4ndee',
+  handle: 'cherry0104123',
   displayName: '还在折腾',
   tagline: '作者主页 · 欢迎持续关注获取更多内容…',
   followed: false,
