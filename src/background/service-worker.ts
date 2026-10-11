@@ -108,6 +108,8 @@ async function ensureXTab(): Promise<chrome.tabs.Tab> {
       await log('INFO', '导航至首页时间线');
       await chrome.tabs.update(existing.id, { url: HOME_TIMELINE_URL, active: true });
       await waitForTabReady(existing.id);
+    } else {
+      await reloadToFreshTimeline(existing.id);
     }
     return existing;
   }
@@ -119,6 +121,47 @@ async function ensureXTab(): Promise<chrome.tabs.Tab> {
     await waitForTabReady(created.id);
   }
   return created;
+}
+
+/**
+ * 已在首页时也要整页刷新，取一份全新的时间线。
+ *
+ * X 的时间线是虚拟列表：不刷新就还是同一批推文，而它们的指纹全部命中
+ * runtime.counters.seen，循环只能靠空转计数提前收尾 —— 表现为「巡航在跑，
+ * 但一轮也做不动」。刷完首屏就是最新的推文。
+ *
+ * 顺序有讲究：先挂好 onUpdated 监听，**再**触发 reload。反过来做会在
+ * 「reload 已派发、浏览器还没开始加载」的窗口里读到旧页面的
+ * `status === 'complete'`，于是把整轮指令发给一个即将被卸载的 content script。
+ */
+async function reloadToFreshTimeline(tabId: number): Promise<void> {
+  await log('INFO', '刷新首页时间线');
+  const navigated = waitTabNavigated(tabId);
+  await chrome.tabs.reload(tabId);
+  await navigated;
+  // 与 waitForTabReady 一致：给 X 的 React 首屏渲染留时间
+  await sleep(1500);
+}
+
+/** 等到标签页完成一次「loading → complete」的真实导航 */
+function waitTabNavigated(tabId: number, timeoutMs = 30_000): Promise<void> {
+  return new Promise((resolve) => {
+    let sawLoading = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (): void => {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve();
+    };
+    const onUpdated = (id: number, info: chrome.tabs.TabChangeInfo): void => {
+      if (id !== tabId) return;
+      if (info.status === 'loading') sawLoading = true;
+      else if (info.status === 'complete' && sawLoading) finish();
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    // 兜底：导航因故没有事件（如被拦截），超时后照常放行
+    timer = setTimeout(finish, timeoutMs);
+  });
 }
 
 async function waitForTabReady(tabId: number, timeoutMs = 30_000): Promise<void> {
@@ -244,7 +287,7 @@ async function executeRoundCycle(round: number): Promise<void> {
   const settings = await getSettings();
   const a = settings.automation;
 
-  // 每轮开始先把页面拉回首页时间线
+  // 每轮开始先把页面拉回首页时间线，并整页刷新取最新推文
   await pushRuntime({ phase: 'navigating', round: round + 1 });
   let tab: chrome.tabs.Tab;
   try {
