@@ -404,51 +404,169 @@ export async function likeArticle(article: Element): Promise<'liked' | 'already'
 }
 
 /**
- * 关注作者：优先使用推文内的关注按钮；
- * 时间线上的推文通常没有关注按钮，需要点进 Profile —— 这里只做前者，
- * 后者交给 service worker 决定是否值得跳转，避免打断巡航节奏。
+ * 关注作者。
+ *
+ * 实测：时间线里的推文块内**没有任何关注按钮**（article 内的 data-testid 只有
+ * Tweet-User-Avatar / User-Name / icon-verified / caret / tweetText / reply /
+ * retweet / like / bookmark）。详情页才可能带内联按钮。所以：
+ * 内联按钮优先，取不到就走推文右上角 `…` 菜单里的 `Follow @handle`。
  *
  * 返回值口径：`'already'` **只**在点击之前判定，即"根本没点"。
- * 一旦点了就是 `'followed'`（状态翻转确认）或 `'failed'`（没能确认），
+ * 一旦点了就是 `'followed'`（复查菜单确认状态翻转）或 `'failed'`（没能确认），
  * 上层据此统计"实际点出去多少次关注"，作为配额的硬上限。
  */
 export async function followAuthor(article: Element): Promise<'followed' | 'already' | 'unavailable' | 'failed'> {
   if (article.querySelector(X_SELECTORS.unfollow)) return 'already';
 
-  const target = await locateFollowButton(article);
-  if (!target) return 'unavailable';
+  const inline = queryAll<HTMLElement>(X_SELECTORS.follow, article).find(isVisible);
+  if (inline) {
+    if (!(await clickWithPause(inline, [600, 1600]))) return 'failed';
+    await randomDelay(600, 1400);
+    return confirmedFollowNear(inline, article) ? 'followed' : 'failed';
+  }
 
-  const ok = await clickWithPause(target.btn, [600, 1600]);
-  if (!ok) return 'failed';
-  await randomDelay(600, 1400);
+  const handle = handleOf(article);
+  if (!handle) return 'unavailable';
+  return followViaMenu(article, handle);
+}
 
-  return confirmedFollowNear(target.btn, article) ? 'followed' : 'failed';
+/** 这条推文作者对应的「已关注」菜单条目文本（只用于判定，绝不点击） */
+const UNFOLLOW_ITEM_RE = /^(?:unfollow|following|取消关注|已关注)\s*@([a-z0-9_]+)$/i;
+/** 「尚未关注」的菜单条目文本 */
+const FOLLOW_ITEM_RE = /^(?:follow|关注)\s*@([a-z0-9_]+)$/i;
+
+/** 菜单条目的可见文本（X 会插入零宽字符做分词） */
+function normalizeItemText(el: Element): string {
+  return (el.textContent ?? '').replace(/\u200b/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/** 取这条推文作者的 handle（不含 @） */
+function handleOf(article: Element): string {
+  const atLink = Array.from(
+    article.querySelectorAll<HTMLAnchorElement>('div[data-testid="User-Name"] a[href^="/"]'),
+  ).find((a) => (a.textContent ?? '').trim().startsWith('@'));
+  if (atLink) {
+    const text = (atLink.textContent ?? '').replace(/\u200b/g, '').trim();
+    if (text.length > 1) return text.slice(1).trim();
+    const seg = atLink.getAttribute('href')?.split('/').filter(Boolean)[0];
+    if (seg) return seg;
+  }
+  // 兜底：头像容器的 testid 形如 UserAvatar-Container-<handle>（实测存在）
+  const container = article.querySelector<HTMLElement>(
+    'div[data-testid="User-Name"] [data-testid^="UserAvatar-Container-"]',
+  )?.dataset.testid;
+  const fromTestId = container?.slice('UserAvatar-Container-'.length);
+  return fromTestId && fromTestId !== 'unknown' ? fromTestId : '';
+}
+
+/** 按 handle 重新定位一条推文。关注状态是按作者记的，同作者任意一条都能用来复查 */
+function findArticleByHandle(handle: string): Element | null {
+  const wanted = handle.toLowerCase();
+  return queryAll<Element>(X_SELECTORS.tweet).find((a) => handleOf(a).toLowerCase() === wanted) ?? null;
 }
 
 /**
- * 定位这条推文对应的关注按钮。
+ * 走推文右上角 `…` 菜单关注作者。
  *
- * 时间线上的推文自身不带关注按钮，只有悬停作者名才会弹出快捷关注卡片。
- * 卡片挂在 body 下的 portal 里，与推文块没有祖先关系，因此这里用
- * 「悬停前后按钮集合的差集」来认它 —— 早先的实现是
- * `document.querySelector('[data-testid$="-follow"]')` 全局取第一个，
- * 而首页右栏「推荐关注」区块里全是同款按钮，等于随手关注一个陌生人。
+ * 早先这里是「向 @handle 链接派发 mouseover，再对悬停前后 document 里的
+ * `-follow` 按钮集合求差」。实测两个致命问题：
+ *  1. 合成悬停打不开 hover 卡片（要派发完整 pointer+mouse 序列、且绑在显示名
+ *     链接上而不是 @handle 链接或头像），只发 mouseover 时永远 `unavailable`；
+ *  2. 更危险 —— 右栏「推荐关注」常驻多颗 `-follow` 按钮并会自行轮换，差集会把
+ *     轮换出来的**陌生人**按钮认成卡片按钮点下去，`confirmedFollowNear` 还在
+ *     陌生人自己的卡片子树里校验得到"关注成功"。
+ * 菜单条目文本自带 `@handle`（实测 `Unfollow @Xiaoyzi_Web3`），身份由文本确定。
  */
-async function locateFollowButton(article: Element): Promise<{ btn: HTMLElement } | null> {
-  const inline = article.querySelector<HTMLElement>(X_SELECTORS.follow);
-  if (inline && isVisible(inline)) return { btn: inline };
+async function followViaMenu(
+  article: Element,
+  handle: string,
+): Promise<'followed' | 'already' | 'unavailable' | 'failed'> {
+  const caret = article.querySelector<HTMLElement>('[data-testid="caret"]');
+  if (!caret) return 'unavailable';
 
-  const handleLink = Array.from(article.querySelectorAll<HTMLAnchorElement>('a[href^="/"]')).find((a) =>
-    (a.textContent ?? '').trim().startsWith('@'),
+  const found = await openMenuAndFind(caret, handle);
+  if (found.state === 'unfollow') {
+    await closeMenu(caret);
+    return 'already';
+  }
+  if (found.state !== 'follow' || !found.entry) {
+    await closeMenu(caret);
+    return 'unavailable';
+  }
+
+  // 菜单里的条目不能走 clickWithPause：它会先把元素滚进视野，而 X 的菜单
+  // 一滚动就自己关掉了。这里直接派发点击。
+  if (!humanClick(clickableAncestor(found.entry))) {
+    await closeMenu(caret);
+    return 'failed';
+  }
+  await randomDelay(700, 1500);
+
+  const recheck = findArticleByHandle(handle) ?? article;
+  const recheckCaret = recheck.querySelector<HTMLElement>('[data-testid="caret"]');
+  if (!recheckCaret) return 'failed';
+  const again = await openMenuAndFind(recheckCaret, handle);
+  const confirmed = again.state === 'unfollow';
+  await closeMenu(recheckCaret);
+  return confirmed ? 'followed' : 'failed';
+}
+
+/**
+ * 点开 `…` 菜单并找出与该作者对应的条目。
+ *
+ * 返回 `state === 'follow'` 时菜单**保持打开**（调用方要点的那一条只在菜单开着
+ * 时才存在于 DOM 里）；其余情况顺手把菜单关掉再返回，不留悬浮层。
+ */
+async function openMenuAndFind(
+  caret: HTMLElement,
+  handle: string,
+): Promise<{ state: 'follow' | 'unfollow' | 'none'; entry: HTMLElement | null }> {
+  const wanted = handle.toLowerCase();
+  if (!(await clickWithPause(caret, [350, 700]))) return { state: 'none', entry: null };
+
+  const menu = await waitForMenu();
+  if (!menu) return { state: 'none', entry: null };
+
+  const items = Array.from(
+    menu.querySelectorAll<HTMLElement>('[role="menuitem"], li, [data-testid="dropdownItem"]'),
   );
-  if (!handleLink) return null;
+  for (const el of items) {
+    const text = normalizeItemText(el);
+    const unfollowed = UNFOLLOW_ITEM_RE.exec(text);
+    if (unfollowed) {
+      if (unfollowed[1].toLowerCase() === wanted) return { state: 'unfollow', entry: null };
+      continue;
+    }
+    const followed = FOLLOW_ITEM_RE.exec(text);
+    if (followed && followed[1].toLowerCase() === wanted) return { state: 'follow', entry: el };
+  }
+  await closeMenu(caret);
+  return { state: 'none', entry: null };
+}
 
-  const before = new Set(queryAll<HTMLElement>(X_SELECTORS.follow));
-  handleLink.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: 0, clientY: 0 }));
-  await randomDelay(200, 500);
+/** 等菜单渲染出来（X 的菜单挂在 body 下的 portal 里） */
+async function waitForMenu(timeoutMs = 1500): Promise<HTMLElement | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (isHumanizerAborted()) return null;
+    const menu = document.querySelector<HTMLElement>('[role="menu"]');
+    if (menu && isVisible(menu)) return menu;
+    if (Date.now() >= deadline) return null;
+    await sleep(120);
+  }
+}
 
-  const fresh = queryAll<HTMLElement>(X_SELECTORS.follow).find((b) => !before.has(b) && isVisible(b));
-  return fresh ? { btn: fresh } : null;
+/** 收起菜单：先按 Escape，个别构建不吃合成按键就再点一次 `…` 把它 toggle 掉 */
+async function closeMenu(caret: HTMLElement): Promise<void> {
+  if (!document.querySelector('[role="menu"]')) return;
+  document.documentElement.dispatchEvent(
+    new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+  );
+  await randomDelay(120, 260);
+  if (document.querySelector('[role="menu"]') && isVisible(caret)) {
+    humanClick(clickableAncestor(caret));
+    await randomDelay(120, 260);
+  }
 }
 
 /**
