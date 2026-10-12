@@ -8,7 +8,15 @@
  *     SW 只做调度与状态，不在 SW 里操作 DOM。
  */
 
-import type { Result, SelfTestReport, TweetDetailContext, TweetSnapshot, ToContentMessage } from '../shared/types';
+import type {
+  Result,
+  RoundReport,
+  SelfTestReport,
+  ToBackgroundMessage,
+  TweetDetailContext,
+  TweetSnapshot,
+  ToContentMessage,
+} from '../shared/types';
 import { extractDetail, extractTimeline, parseArticle, probeSelectors, visibleArticles } from './dom-extractor';
 import {
   fillEditor,
@@ -36,7 +44,7 @@ import {
 /* 与 service worker 的握手                                            */
 /* ------------------------------------------------------------------ */
 
-async function sendToSw<T = unknown>(message: unknown): Promise<Result<T>> {
+async function sendToSw<T = unknown>(message: ToBackgroundMessage): Promise<Result<T>> {
   try {
     const res = (await chrome.runtime.sendMessage(message)) as Result<T> | undefined;
     return res ?? { ok: false, error: 'service worker 无响应' };
@@ -157,7 +165,7 @@ async function humanPause(minMs: number, maxMs: number): Promise<void> {
 
 /**
  * 单轮巡航的完整执行体。
- * 调用方（service worker）通过 SW_EXECUTE_ROUND 下发一次，本函数自驱完成整轮。
+ * 调用方（service worker）通过 CS_AUTO_ROUND 下发一次，本函数自驱完成整轮。
  */
 export interface RoundPayload {
   likeQuota: number;
@@ -172,18 +180,12 @@ export interface RoundPayload {
   autoSubmitComment: boolean;
   /** 轮开始时 SW 认为已经处理过的指纹 */
   seen: string[];
+  /** 本轮 runtime.roundStartedAt，上报结果时原样回传，供 SW 丢弃迟到报告 */
+  roundStartedAt: number;
 }
 
-export interface RoundOutcome {
-  likes: number;
-  comments: number;
-  follows: number;
-  drafts: number;
-  scanned: number;
-  seen: string[];
-  aborted: boolean;
-  error: string | null;
-}
+/** 单轮产出。形状与 shared 的上报契约同源，避免两处各自维护字段 */
+export type RoundOutcome = RoundReport;
 
 export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome> {
   const outcome: RoundOutcome = {
@@ -484,7 +486,19 @@ const autoRoundListener = (
   setAutoRoundInFlight(true);
   setHumanizerAborted(false);
   runAutoRound(msg.payload)
-    .then((outcome) => sendResponse({ ok: true, data: outcome } satisfies Result<RoundOutcome>))
+    .then((outcome) => {
+      /*
+       * 结果走**两条**通道送回，缺一不可：
+       *  - sendResponse 只在下发指令的那个 SW 实例还活着时有效；
+       *  - SW_ROUND_REPORT 是一条新消息，即使原实例已被回收，它也会把新实例
+       *    唤起来收尾（写「第 N 轮结束」、进冷却、挂下一次 alarm）。
+       * 一轮要跑几分钟，而 MV3 的 SW 活不了那么久 —— 早先只靠 sendResponse，
+       * 于是轮次结果随旧实例一起消失：日志停在最后一条 swLog 之后，
+       * 既不进冷却也不挂闹钟，巡航就此停摆。
+       */
+      void sendToSw({ type: 'SW_ROUND_REPORT', roundStartedAt: msg.payload.roundStartedAt, report: outcome });
+      sendResponse({ ok: true, data: outcome } satisfies Result<RoundOutcome>);
+    })
     .catch((err: Error) => sendResponse({ ok: false, error: err.message } satisfies Result<never>))
     .finally(() => setAutoRoundInFlight(false));
   return true;

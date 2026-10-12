@@ -227,3 +227,15 @@ export const HOME_TIMELINE_URL = 'https://x.com/home';
 
 /** service worker 中自动化轮次的 alarm 名称 */
 export const ALARM_AUTO_TICK = 'xa-auto-tick';
+
+/** 轮次存活看门狗 alarm：到点仍在「轮内」且没收到结果 → 判定为孤儿轮 */
+export const ALARM_ROUND_WATCHDOG = 'xa-round-watchdog';
+
+/**
+ * 单轮的存活时限。
+ *
+ * 一轮最多浏览 40 条，每条含浏览停顿、点赞停顿、以及可能的详情页往返
+ * （导航 + 阅读驻留 + LLM + 打字注入 + 返回），按默认节奏粗算在 25 分钟量级。
+ * 取 35 分钟留足余量：宁可巡航多等一轮，也不要在轮次还在跑的时候把它打断。
+ */
+export const ROUND_WATCHDOG_MS = 35 * 60_000;

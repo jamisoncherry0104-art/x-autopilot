@@ -301,6 +301,31 @@ export interface SwLogMsg {
 export interface SwGetTabMsg {
   type: 'SW_GET_TAB';
 }
+
+/**
+ * 单轮的产出计数。
+ *
+ * 这份数据必须**双路**送回 SW：sendResponse（SW 还活着）+ SW_ROUND_REPORT
+ * （SW 已被回收，靠这条消息把新实例唤起来收尾）。理由见 SW 的 finalizeRound。
+ */
+export interface RoundReport {
+  likes: number;
+  comments: number;
+  follows: number;
+  drafts: number;
+  scanned: number;
+  seen: string[];
+  aborted: boolean;
+  error: string | null;
+}
+
+/** content script -> SW：轮次结果上报 */
+export interface SwRoundReportMsg {
+  type: 'SW_ROUND_REPORT';
+  /** 原样回传本轮的 roundStartedAt，SW 据此丢弃迟到/错轮的报告 */
+  roundStartedAt: number;
+  report: RoundReport;
+}
 export interface SwToContentMsg {
   type: 'SW_TO_CONTENT';
   /** 任务型 content script 所在标签页 */
@@ -308,7 +333,26 @@ export interface SwToContentMsg {
   payload: ToContentMessage;
 }
 
-export type ToBackgroundMessage = SwLogMsg | SwGetTabMsg | SwToContentMsg;
+/**
+ * content script -> SW：代为调用模型。
+ *
+ * 自动巡航在页面里跑，content script 直接 fetch 既受同源策略约束、又拿不到
+ * host_permissions 授权的任意网关，因此出站 LLM 请求一律转发到 SW 走
+ * proxyGenerate()。字段与 UI 侧的 LLM_GENERATE 同形。
+ */
+export interface SwGenerateForMsg {
+  type: 'SW_GENERATE_FOR';
+  snapshot: TweetSnapshot;
+  /** 详情页主推文上方的上下文推文，渲染进 {tweet_context} */
+  ancestors?: TweetSnapshot[];
+}
+
+export type ToBackgroundMessage =
+  | SwLogMsg
+  | SwGetTabMsg
+  | SwToContentMsg
+  | SwRoundReportMsg
+  | SwGenerateForMsg;
 
 /* --- UI <-> Background 控制面 --- */
 export interface UiStartAutoMsg {

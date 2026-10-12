@@ -9,7 +9,7 @@
  *  3. SW 只作为 LLM 的代理出口，避免 API Key 暴露在页面上下文里。
  */
 
-import { ALARM_AUTO_TICK, HOME_TIMELINE_URL, profileUrl } from '../shared/constants';
+import { ALARM_AUTO_TICK, ALARM_ROUND_WATCHDOG, HOME_TIMELINE_URL, ROUND_WATCHDOG_MS, profileUrl } from '../shared/constants';
 import {
   LlmError,
   createContext,
@@ -33,6 +33,7 @@ import type {
   LogLevel,
   Result,
   RoundCounters,
+  RoundReport,
   ToBackgroundMessage,
   TweetSnapshot,
 } from '../shared/types';
@@ -57,6 +58,15 @@ const state: SwState = { running: false, tabId: null };
  */
 let cycleInFlight = false;
 let resuming = false;
+
+/**
+ * 已经收尾过的轮次（runtime.roundStartedAt）。
+ *
+ * 同一轮的结果会从两条通道回来（sendResponse 续跑 + SW_ROUND_REPORT 上报），
+ * 在 SW 还活着的那个实例里两者都会命中，用它在内存里去重。跨实例的去重靠
+ * 落盘状态：finalizeRound 只处理 phase 仍为「轮内」的运行时，收尾后立刻变 cooling。
+ */
+let finalizedRoundAt: number | null = null;
 
 /* ------------------------------------------------------------------ */
 /* 日志                                                                */
@@ -234,7 +244,9 @@ async function startAutomation(): Promise<Result<{ started: true }>> {
   state.running = true;
   cycleInFlight = false;
   resuming = false;
+  finalizedRoundAt = null;
   await chrome.alarms.clear(ALARM_AUTO_TICK);
+  await clearRoundWatchdog();
   await pushRuntime({
     phase: 'navigating',
     round: 0,
@@ -255,6 +267,7 @@ async function startAutomation(): Promise<Result<{ started: true }>> {
 async function stopAutomation(reason = '用户手动停止'): Promise<Result<{ stopped: true }>> {
   state.running = false;
   await chrome.alarms.clear(ALARM_AUTO_TICK);
+  await clearRoundWatchdog();
 
   // 广播制动，令 content script 立刻放弃当前动作
   const tab = state.tabId ? await chrome.tabs.get(state.tabId).catch(() => null) : null;
@@ -309,24 +322,27 @@ async function executeRoundCycle(round: number): Promise<void> {
   }
 
   const runtime = await getRuntime();
+  const roundStartedAt = Date.now();
   await pushRuntime({
     phase: 'scrolling',
-    roundStartedAt: Date.now(),
+    roundStartedAt,
     counters: { ...countersSnapshot(), seen: runtime.counters.seen },
   });
 
   await log('INFO', `===== 第 ${round + 1} 轮开始 =====`);
 
-  const res = await sendToTab<{
-    likes: number;
-    comments: number;
-    follows: number;
-    drafts: number;
-    scanned: number;
-    seen: string[];
-    aborted: boolean;
-    error: string | null;
-  }>(tab.id, {
+  /*
+   * 先挂看门狗，再发指令。
+   *
+   * 一轮要跑几分钟到几十分钟，而 MV3 的 SW 活不了那么久（空闲约 30s 回收，
+   * 连续活动也有绝对上限）—— 下发指令的这个实例大概率撑不到结果回来。
+   * 因此轮次结果除了走 sendResponse，content script 还会另发一条 SW_ROUND_REPORT
+   * 把**新实例**唤起来收尾；万一两条都没到（标签页被关、页面崩溃、脚本被卸载），
+   * 就由这个 alarm 兜底。否则巡航就停在最后一轮，再也没有东西把它叫醒。
+   */
+  armRoundWatchdog(roundStartedAt);
+
+  const res = await sendToTab<RoundReport>(tab.id, {
     type: 'CS_AUTO_ROUND',
     payload: {
       likeQuota: a.likeQuotaPerRound,
@@ -340,49 +356,84 @@ async function executeRoundCycle(round: number): Promise<void> {
       readDwellMs: a.readDwellMs,
       autoSubmitComment: a.autoSubmitComment,
       seen: runtime.counters.seen,
+      roundStartedAt,
     },
   });
-
-  if (!state.running) return; // 期间被制动
 
   if (!res.ok) {
     await failRound(`轮次执行失败：${res.error}`);
     return;
   }
 
-  const outcome = res.data;
-  await pushRuntime({
-    phase: 'cooling',
-    counters: {
-      likes: outcome.likes,
-      comments: outcome.comments,
-      follows: outcome.follows,
-      drafts: outcome.drafts,
-      scanned: outcome.scanned,
-      seen: outcome.seen,
-    },
-  });
+  await finalizeRound(roundStartedAt, res.data);
+}
 
-  await log(
-    'DONE',
-    `第 ${round + 1} 轮结束｜赞 ${outcome.likes}・评 ${outcome.comments}・关注 ${outcome.follows}` +
-      `${outcome.drafts > 0 ? `・草稿 ${outcome.drafts}` : ''}｜浏览 ${outcome.scanned} 条`,
-  );
-  if (outcome.error) await log('ERROR', `轮次内异常：${outcome.error}`);
+/**
+ * 轮次收尾：写计数 → 进冷却 → 挂下一次唤醒。
+ *
+ * 由三条路径调用，且必须是**幂等**的：
+ *  - sendResponse 的续跑（下发指令的实例还活着）；
+ *  - SW_ROUND_REPORT（实例已被回收，由这条消息把新实例唤起来）；
+ *  - 看门狗到点，此时拿不到结果，只把状态推下去。
+ *
+ * 判定「这一轮已经收过尾」不依赖内存状态：收尾后 phase 立刻变成 cooling，
+ * 而这里只接受轮内状态（navigating / scrolling），所以跨实例的重复调用会被丢弃。
+ */
+async function finalizeRound(roundStartedAt: number, report: RoundReport | null): Promise<void> {
+  // 去重闸门放在**第一个 await 之前**：SW 还活着时两条通道会在同一个实例里并发
+  // 走到这里，若先 await 再判，两边都可能通过检查、把收尾做两遍（重复日志、
+  // 重复计算冷却时长）。
+  if (finalizedRoundAt === roundStartedAt) return; // 本实例里另一条通道已经收尾
+  finalizedRoundAt = roundStartedAt;
 
-  // 冷却
+  const rt = await getRuntime();
+  if (rt.phase !== 'navigating' && rt.phase !== 'scrolling') return; // 已收尾 / 已制动
+  if (rt.roundStartedAt !== roundStartedAt) return; // 迟到的旧轮报告
+
+  await clearRoundWatchdog();
+
+  const settings = await getSettings();
+  const round = rt.round;
+  const counters: RoundCounters | undefined = report
+    ? {
+        ...rt.counters,
+        likes: report.likes,
+        comments: report.comments,
+        follows: report.follows,
+        drafts: report.drafts,
+        scanned: report.scanned,
+        seen: report.seen,
+      }
+    : undefined;
+
+  await pushRuntime({ phase: 'cooling', roundStartedAt: null, counters });
+
+  if (report) {
+    await log(
+      'DONE',
+      `第 ${round + 1} 轮结束｜赞 ${report.likes}・评 ${report.comments}・关注 ${report.follows}` +
+        `${report.drafts > 0 ? `・草稿 ${report.drafts}` : ''}｜浏览 ${report.scanned} 条`,
+    );
+    if (report.error) await log('ERROR', `轮次内异常：${report.error}`);
+  } else {
+    await log('WARNING', `第 ${round + 1} 轮结果未能送达，按「未知」收尾（页面动作已中止）`);
+  }
+
   const [minM, maxM] = settings.automation.roundSleepMin;
   const sleepMs = Math.round((minM + Math.random() * Math.max(0, maxM - minM)) * 60_000);
   const wakeAt = Date.now() + sleepMs;
 
-  await pushRuntime({ phase: 'cooling', nextRoundAt: wakeAt });
+  await pushRuntime({ nextRoundAt: wakeAt });
   await log('WAIT', `进入冷却，将在 ${Math.round(sleepMs / 60000)} 分钟后开始第 ${round + 2} 轮`);
 
+  state.running = true; // 收尾即意味着巡航意图仍在
   scheduleWake(wakeAt);
 }
 
 async function failRound(reason: string): Promise<void> {
   await log('ERROR', reason);
+  // 本轮已经认输：留着看门狗的话，它会在下一轮在飞时误判成孤儿轮并把它打断
+  await clearRoundWatchdog();
   await pushRuntime({ phase: 'error', lastError: reason, nextRoundAt: null });
   if (state.running) {
     // 出错后等 2 分钟重试本轮，而不是直接放弃。
@@ -413,8 +464,26 @@ function scheduleWake(at: number): void {
 }
 
 /**
+ * 轮次存活看门狗。
+ *
+ * 起点固定用 roundStartedAt 而不是 now：轮内每几条动作就有 swLog 消息把 SW
+ * 唤醒一次，若按 now 续期，这个看门狗会被自己无限延后，等于没有。
+ * 已过期时 Chrome 会很快触发，正好落到恢复分支里收尾。
+ */
+function armRoundWatchdog(roundStartedAt: number): void {
+  void chrome.alarms
+    .clear(ALARM_ROUND_WATCHDOG)
+    .then(() => chrome.alarms.create(ALARM_ROUND_WATCHDOG, { when: roundStartedAt + ROUND_WATCHDOG_MS }));
+}
+
+async function clearRoundWatchdog(): Promise<void> {
+  await chrome.alarms.clear(ALARM_ROUND_WATCHDOG).catch(() => undefined);
+}
+
+/**
  * alarm 到点后的恢复：从 storage 读回运行意图，不依赖任何内存状态。
  *
+ *  - phase === 'navigating' / 'scrolling' → 看门狗到点，轮次结果丢失 → 孤儿轮收尾
  *  - phase === 'cooling' → 冷却结束，跑**下一轮**（runtime.round 是刚跑完的那轮）
  *  - phase === 'error'   → 上次失败，**重试本轮**
  *  - 其余（stopped / idle）→ 用户已主动停手，不动
@@ -426,6 +495,12 @@ async function resumeAfterWake(): Promise<void> {
   resuming = true;
   try {
     const rt = await getRuntime();
+
+    if (rt.phase === 'navigating' || rt.phase === 'scrolling') {
+      await abandonInFlightRound(rt);
+      return;
+    }
+
     if (!rt.nextRoundAt) return;
     if (rt.phase !== 'cooling' && rt.phase !== 'error') return;
 
@@ -442,8 +517,26 @@ async function resumeAfterWake(): Promise<void> {
   }
 }
 
+/**
+ * 孤儿轮收尾：结果两条通道都没到（标签页被关、页面崩溃、脚本被卸载）。
+ *
+ * 必须先广播制动 —— 页面里的整轮循环是 content script 在跑，SW 死了它照旧运行；
+ * 若直接进冷却，下一轮唤醒时上一轮的残留循环可能还在点按钮，动作翻倍正是
+ * 账号风险最大的方向。
+ */
+async function abandonInFlightRound(rt: AutomationRuntime): Promise<void> {
+  state.running = true;
+  state.tabId = (await findXTab())?.id ?? null;
+  await log(
+    'WARNING',
+    `第 ${rt.round + 1} 轮超过 ${Math.round(ROUND_WATCHDOG_MS / 60_000)} 分钟仍未回报结果，判定为丢失`,
+  );
+  if (state.tabId !== null) await sendToTab(state.tabId, { type: 'CS_ABORT' });
+  if (rt.roundStartedAt !== null) await finalizeRound(rt.roundStartedAt, null);
+}
+
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== ALARM_AUTO_TICK) return;
+  if (alarm.name !== ALARM_AUTO_TICK && alarm.name !== ALARM_ROUND_WATCHDOG) return;
   void resumeAfterWake();
 });
 
@@ -635,6 +728,19 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
     return false;
   }
 
+  // ---- content script -> SW：轮次结果 ----
+  //
+  // 这是一条**独立**消息，作用是让被回收后重新唤起的 SW 实例也能收尾。
+  // 只靠 CS_AUTO_ROUND 的 sendResponse 不够：那条通道绑在下发指令的那个实例上，
+  // 实例被回收后 sendResponse 就是空操作，收尾续跑随之丢失。
+  if (msg.type === 'SW_ROUND_REPORT') {
+    const m = message as Extract<ToBackgroundMessage, { type: 'SW_ROUND_REPORT' }>;
+    if (state.tabId === null && sender.tab?.id) state.tabId = sender.tab.id;
+    void finalizeRound(m.roundStartedAt, m.report);
+    sendResponse(ok({ recorded: true }));
+    return false;
+  }
+
   // ---- content script -> SW：代理转发 ----
   if (msg.type === 'SW_TO_CONTENT') {
     const m = message as Extract<ToBackgroundMessage, { type: 'SW_TO_CONTENT' }>;
@@ -644,7 +750,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
 
   // ---- content script -> SW：生成评论 ----
   if (msg.type === 'SW_GENERATE_FOR') {
-    const m = message as { snapshot: TweetSnapshot; ancestors?: TweetSnapshot[] };
+    const m = message as Extract<ToBackgroundMessage, { type: 'SW_GENERATE_FOR' }>;
     proxyGenerate(m.snapshot, m.ancestors)
       .then((r) => {
         if (!r.ok) void log('ERROR', `LLM 调用失败：${r.error}`);
@@ -740,6 +846,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // 首帧兜底：SW 冷启动时把中断的等待续上
 void (async () => {
   const rt = await getRuntime();
+
+  // 轮次还在飞（本实例只是被顺带唤醒的）：确认看门狗在位。armRoundWatchdog
+  // 以 roundStartedAt 为起点，重复唤醒不会把时限往后推。
+  if (rt.phase === 'navigating' || rt.phase === 'scrolling') {
+    state.running = true;
+    if (rt.roundStartedAt !== null) armRoundWatchdog(rt.roundStartedAt);
+    return;
+  }
+
   if (rt.phase !== 'cooling' && rt.phase !== 'error') return;
   if (!rt.nextRoundAt) return;
 
