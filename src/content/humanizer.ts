@@ -148,31 +148,47 @@ export async function typingPause(chunk: string, baseSpeedMs = 28): Promise<void
 /* ------------------------------------------------------------------ */
 
 /**
- * 制动标记只对**自动轮次**生效。
+ * 制动标记只对**当前在飞的那一轮**生效。
  *
- * 早先只有一个 abortFlag，且只在下一轮 CS_AUTO_ROUND 开头才复位。于是按过
- * 一次紧急制动之后（哪怕当时根本没有轮次在跑，比如只是冷却中），
- * 手动模式的「仅填入 / 填入并发送」会因为 typewriterInto 里的检查而永久失败，
- * 还回一句误导性的「请手动点击评论框后重试」—— 只能刷新页面才能恢复。
+ * 早先这里是一个裸布尔 `autoRoundInFlight`，且谁先收尾谁就把它连带 abort 一起
+ * 清掉。看门狗判定轮次丢失后启动的新轮次会 `setHumanizerAborted(false)`，于是
+ * 「上一轮其实还在跑」和「制动已经解除」同时成立 —— 结果就是页面里两个、三个
+ * 循环并发点按钮，点赞/评论/关注成倍叠加，而且没有任何东西还能停住它们。
  *
- * 因此把「是否有自动轮次在飞」单独记一份：制动是终止巡航的手段，
- * 不是把整个 content script 打进死状态的开关。
+ * 现在用轮次号（runtime.roundStartedAt）当持有者令牌：
+ *  - 认领：只在没有别的轮次在飞时成功，认领顺带清掉遗留的制动请求；
+ *  - 释放：只有持有者自己能释放，僵尸轮的 finally 动不了在跑那轮；
+ *  - 手动模式下 currentRunId 为 0，isHumanizerAborted() 恒为 false，行为不变
+ *    （制动是终止巡航的手段，不是把整个 content script 打进死状态的开关）。
  */
+let currentRunId = 0;
 let abortRequested = false;
-let autoRoundInFlight = false;
+
+/** 认领巡航轮次。已有别的轮次在飞时返回 false，调用方据此拒绝并发 */
+export function claimAutoRound(runId: number): boolean {
+  if (currentRunId !== 0 && currentRunId !== runId) return false;
+  currentRunId = runId;
+  abortRequested = false;
+  return true;
+}
+
+/** 释放巡航轮次；非持有者调用是空操作 */
+export function releaseAutoRound(runId: number): void {
+  if (currentRunId !== runId) return;
+  currentRunId = 0;
+  abortRequested = false;
+}
+
+export function isAutoRoundInFlight(): boolean {
+  return currentRunId !== 0;
+}
 
 export function setHumanizerAborted(v: boolean): void {
   abortRequested = v;
 }
 
-/** 由 CS_AUTO_ROUND 的起止调用；轮次收尾时顺带清掉遗留的制动请求 */
-export function setAutoRoundInFlight(v: boolean): void {
-  autoRoundInFlight = v;
-  if (!v) abortRequested = false;
-}
-
 export function isHumanizerAborted(): boolean {
-  return abortRequested && autoRoundInFlight;
+  return currentRunId !== 0 && abortRequested;
 }
 
 /** 可被紧急制动打断的延时 */

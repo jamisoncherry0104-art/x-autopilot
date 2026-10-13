@@ -30,12 +30,14 @@ import {
 } from './dom-actions';
 import {
   browseBurst,
+  claimAutoRound,
   interruptibleDelay,
+  isAutoRoundInFlight,
   isHumanizerAborted,
   microScroll,
   randomDelay,
+  releaseAutoRound,
   scrollIntoComfortZone,
-  setAutoRoundInFlight,
   setHumanizerAborted,
   smoothScrollBy,
 } from './humanizer';
@@ -132,6 +134,10 @@ const handlers: Record<ToContentMessage['type'], Handler> = {
 
   async CS_SELFTEST() {
     return ok<SelfTestReport>(probeSelectors());
+  },
+
+  async CS_ROUND_STATE() {
+    return ok({ inFlight: isAutoRoundInFlight() });
   },
 };
 
@@ -231,6 +237,19 @@ export async function runAutoRound(payload: RoundPayload): Promise<RoundOutcome>
 
   try {
     while (!isHumanizerAborted()) {
+      /*
+       * 后台标签页里的巡航不是「慢」，是「被降速到不可用」。
+       *
+       * 拟人化延时全是页面 setTimeout，而 Chrome 对隐藏标签页启用 Intensive
+       * Throttling，计时器最低能被钳到约 1 次/分钟 —— 实测过一个点赞从排队到
+       * 落地花了 56 分钟。硬爬既烧机器又让轮次永远跑不完（看门狗只能反复判丢失），
+       * 所以直接按已完成量收尾：进冷却，冷却结束若仍在后台就再来一次快速收尾。
+       */
+      if (document.visibilityState === 'hidden') {
+        swLog('WARNING', 'x.com 标签页处于后台（浏览器已把页面计时器降速），本轮按已完成量提前收尾');
+        break;
+      }
+
       iterations += 1;
       if (iterations > maxIterations) {
         swLog('WARNING', `达到单轮迭代上限 ${maxIterations} 次，提前收尾`);
@@ -483,8 +502,19 @@ const autoRoundListener = (
   const msg = message as AutoRunMessage;
   if (msg?.type !== 'CS_AUTO_ROUND') return false;
 
-  setAutoRoundInFlight(true);
-  setHumanizerAborted(false);
+  const runId = msg.payload.roundStartedAt;
+  /*
+   * 并发闸门（页面侧的最后一道）。
+   *
+   * SW 侧已经改为「上一轮还在飞就不启动下一轮」，但 SW 会被回收、状态可能失真，
+   * 所以这里再拦一次：两个循环同时操作同一个 x.com 页面 = 动作成倍，账号风险的
+   * 直接放大器。轮次号用 roundStartedAt，天然唯一，不用另发一个新字段。
+   */
+  if (!claimAutoRound(runId)) {
+    sendResponse({ ok: false, error: '上一轮仍在页面中运行，拒绝并发启动第二轮' } satisfies Result<never>);
+    return false;
+  }
+
   runAutoRound(msg.payload)
     .then((outcome) => {
       /*
@@ -496,11 +526,11 @@ const autoRoundListener = (
        * 于是轮次结果随旧实例一起消失：日志停在最后一条 swLog 之后，
        * 既不进冷却也不挂闹钟，巡航就此停摆。
        */
-      void sendToSw({ type: 'SW_ROUND_REPORT', roundStartedAt: msg.payload.roundStartedAt, report: outcome });
+      void sendToSw({ type: 'SW_ROUND_REPORT', roundStartedAt: runId, report: outcome });
       sendResponse({ ok: true, data: outcome } satisfies Result<RoundOutcome>);
     })
     .catch((err: Error) => sendResponse({ ok: false, error: err.message } satisfies Result<never>))
-    .finally(() => setAutoRoundInFlight(false));
+    .finally(() => releaseAutoRound(runId));
   return true;
 };
 

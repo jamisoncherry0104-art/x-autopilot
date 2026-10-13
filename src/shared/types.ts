@@ -275,6 +275,16 @@ export interface CsHumanDelayMsg {
 export interface CsSelfTestMsg {
   type: 'CS_SELFTEST';
 }
+/**
+ * 查询页面里「是否还有一轮巡航在跑」。
+ *
+ * 看门狗到点不能直接判定轮次丢失：一轮在后台标签页里可能被 Chrome 的
+ * Intensive Throttling 拖到几十分钟（计时器被钳到 ~1 次/分钟），它并没有死，
+ * 只是慢。此时并发启动第二轮会让点赞/评论/关注成倍叠加，是最危险的方向。
+ */
+export interface CsRoundStateMsg {
+  type: 'CS_ROUND_STATE';
+}
 
 export type ToContentMessage =
   | CsPingMsg
@@ -284,7 +294,8 @@ export type ToContentMessage =
   | CsFollowMsg
   | CsFollowProfileMsg
   | CsHumanDelayMsg
-  | CsSelfTestMsg;
+  | CsSelfTestMsg
+  | CsRoundStateMsg;
 
 /** CS_FOLLOW 的结果 */
 export type FollowOutcome = 'followed' | 'already' | 'unavailable' | 'failed';

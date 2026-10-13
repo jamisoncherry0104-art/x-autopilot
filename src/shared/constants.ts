@@ -239,3 +239,11 @@ export const ALARM_ROUND_WATCHDOG = 'xa-round-watchdog';
  * 取 35 分钟留足余量：宁可巡航多等一轮，也不要在轮次还在跑的时候把它打断。
  */
 export const ROUND_WATCHDOG_MS = 35 * 60_000;
+
+/**
+ * 发现「上一轮还在页面里跑」时的复查间隔。
+ *
+ * 标签页被切到后台后，Chrome 会把页面计时器降速到约每分钟一次，一轮因此能拖到
+ * 几十分钟甚至几小时。这种情况只推迟下发、不并发开新轮，隔一段时间再问一次页面。
+ */
+export const ROUND_DEFER_POLL_MS = 5 * 60_000;

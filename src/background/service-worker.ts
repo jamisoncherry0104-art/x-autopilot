@@ -9,7 +9,7 @@
  *  3. SW 只作为 LLM 的代理出口，避免 API Key 暴露在页面上下文里。
  */
 
-import { ALARM_AUTO_TICK, ALARM_ROUND_WATCHDOG, HOME_TIMELINE_URL, ROUND_WATCHDOG_MS, profileUrl } from '../shared/constants';
+import { ALARM_AUTO_TICK, ALARM_ROUND_WATCHDOG, HOME_TIMELINE_URL, ROUND_DEFER_POLL_MS, ROUND_WATCHDOG_MS, profileUrl } from '../shared/constants';
 import {
   LlmError,
   createContext,
@@ -260,7 +260,7 @@ async function startAutomation(): Promise<Result<{ started: true }>> {
   await patchSettings({ automation: { enabled: true } });
   await log('INFO', '自动巡航已启动');
 
-  void runRoundCycle(0);
+  void runRoundCycle(1);
   return { ok: true, data: { started: true } };
 }
 
@@ -282,7 +282,14 @@ async function stopAutomation(reason = '用户手动停止'): Promise<Result<{ s
   return { ok: true, data: { stopped: true } };
 }
 
-/** 单轮循环：执行 → 冷却 → 下一轮 */
+/**
+ * 单轮循环：执行 → 冷却 → 下一轮。
+ *
+ * `round` 是**面向日志的轮号，从 1 开始**，并且会原样写进 runtime.round。
+ * 也就是说 runtime.round 恒等于「当前（或最近一次）轮次的编号」，
+ * 需要它的时候直接读，不要再 +1 —— 之前这里传的是 0 基下标、别处按 1 基读，
+ * 同一份状态被两套编号解释，日志才会出现「第 5 轮结束后开始第 5 轮」。
+ */
 async function runRoundCycle(round: number): Promise<void> {
   // 同步占位，早于任何 await —— alarm 与冷启动兜底并发恢复时后到者直接退出
   if (cycleInFlight) return;
@@ -297,11 +304,24 @@ async function runRoundCycle(round: number): Promise<void> {
 async function executeRoundCycle(round: number): Promise<void> {
   if (!state.running) return;
 
+  /*
+   * 先问页面「上一轮还在跑吗」，且必须早于 ensureXTab()。
+   *
+   * 顺序有讲究：ensureXTab 会整页刷新，刷新会把页面里那一轮直接抹掉，
+   * 于是这个探测永远返回 false，并发也就照常发生。
+   * 而一轮被后台降速拖慢不等于丢失，页面里的循环仍在点按钮；这时候再下发
+   * 一轮，就是两个循环同时操作同一个账号 —— 风险最大的方向。
+   */
+  if ((await inFlightRoundTab()) !== null) {
+    await deferForInFlightRound();
+    return;
+  }
+
   const settings = await getSettings();
   const a = settings.automation;
 
   // 每轮开始先把页面拉回首页时间线，并整页刷新取最新推文
-  await pushRuntime({ phase: 'navigating', round: round + 1 });
+  await pushRuntime({ phase: 'navigating', round });
   let tab: chrome.tabs.Tab;
   try {
     tab = await ensureXTab();
@@ -329,7 +349,7 @@ async function executeRoundCycle(round: number): Promise<void> {
     counters: { ...countersSnapshot(), seen: runtime.counters.seen },
   });
 
-  await log('INFO', `===== 第 ${round + 1} 轮开始 =====`);
+  await log('INFO', `===== 第 ${round} 轮开始 =====`);
 
   /*
    * 先挂看门狗，再发指令。
@@ -411,12 +431,12 @@ async function finalizeRound(roundStartedAt: number, report: RoundReport | null)
   if (report) {
     await log(
       'DONE',
-      `第 ${round + 1} 轮结束｜赞 ${report.likes}・评 ${report.comments}・关注 ${report.follows}` +
+      `第 ${round} 轮结束｜赞 ${report.likes}・评 ${report.comments}・关注 ${report.follows}` +
         `${report.drafts > 0 ? `・草稿 ${report.drafts}` : ''}｜浏览 ${report.scanned} 条`,
     );
     if (report.error) await log('ERROR', `轮次内异常：${report.error}`);
   } else {
-    await log('WARNING', `第 ${round + 1} 轮结果未能送达，按「未知」收尾（页面动作已中止）`);
+    await log('WARNING', `第 ${round} 轮结果未能送达，按「未知」收尾（页面动作已中止）`);
   }
 
   const [minM, maxM] = settings.automation.roundSleepMin;
@@ -424,7 +444,7 @@ async function finalizeRound(roundStartedAt: number, report: RoundReport | null)
   const wakeAt = Date.now() + sleepMs;
 
   await pushRuntime({ nextRoundAt: wakeAt });
-  await log('WAIT', `进入冷却，将在 ${Math.round(sleepMs / 60000)} 分钟后开始第 ${round + 2} 轮`);
+  await log('WAIT', `进入冷却，将在 ${Math.round(sleepMs / 60000)} 分钟后开始第 ${round + 1} 轮`);
 
   state.running = true; // 收尾即意味着巡航意图仍在
   scheduleWake(wakeAt);
@@ -471,9 +491,14 @@ function scheduleWake(at: number): void {
  * 已过期时 Chrome 会很快触发，正好落到恢复分支里收尾。
  */
 function armRoundWatchdog(roundStartedAt: number): void {
+  scheduleRoundWatchdog(roundStartedAt + ROUND_WATCHDOG_MS);
+}
+
+/** 把看门狗挂到指定时刻；「仍在运行」的续期路径按 now 起算，孤儿判定按 roundStartedAt 起算 */
+function scheduleRoundWatchdog(when: number): void {
   void chrome.alarms
     .clear(ALARM_ROUND_WATCHDOG)
-    .then(() => chrome.alarms.create(ALARM_ROUND_WATCHDOG, { when: roundStartedAt + ROUND_WATCHDOG_MS }));
+    .then(() => chrome.alarms.create(ALARM_ROUND_WATCHDOG, { when }));
 }
 
 async function clearRoundWatchdog(): Promise<void> {
@@ -481,9 +506,45 @@ async function clearRoundWatchdog(): Promise<void> {
 }
 
 /**
+ * 页面里是否还有一轮巡航在飞，返回持有它的 tabId（没有则 null）。
+ *
+ * 这是**唯一**可靠的判据。runtime.phase 只能说明 SW 当时以为在轮内，
+ * 而一轮的结果可能在几十分钟之后才从页面里送出来；内存状态跨 SW 回收不可信，
+ * 落盘状态又可能过期，只有直接问页面才知道那个循环还在不在。
+ */
+async function inFlightRoundTab(): Promise<number | null> {
+  const tab = await findXTab();
+  if (!tab?.id) return null;
+  const res = await sendToTab<{ inFlight: boolean }>(tab.id, { type: 'CS_ROUND_STATE' });
+  return res.ok && res.data.inFlight ? tab.id : null;
+}
+
+/**
+ * 「上一轮还在跑」时的处置：只推迟，绝不并发下发第二轮。
+ *
+ * 标签页切到后台后 Chrome 会把页面计时器降速到约每分钟一次，一轮因此能拖到
+ * 几小时。慢不等于丢：那一轮跑完照样会把结果送回来正常收尾。所以这里保持
+ * 状态不动、看门狗顺延，隔几分钟再问一次页面。
+ */
+async function deferForInFlightRound(): Promise<void> {
+  state.running = true;
+  const rt = await getRuntime();
+  if (rt.phase === 'navigating' || rt.phase === 'scrolling') {
+    scheduleRoundWatchdog(Date.now() + ROUND_WATCHDOG_MS);
+  }
+  const wakeAt = Date.now() + ROUND_DEFER_POLL_MS;
+  await log(
+    'WARNING',
+    `第 ${rt.round} 轮仍在页面中运行（标签页多半被切到后台，页面计时器已降速），` +
+      `不并发开新轮，${Math.round(ROUND_DEFER_POLL_MS / 60_000)} 分钟后再查`,
+  );
+  scheduleWake(wakeAt);
+}
+
+/**
  * alarm 到点后的恢复：从 storage 读回运行意图，不依赖任何内存状态。
  *
- *  - phase === 'navigating' / 'scrolling' → 看门狗到点，轮次结果丢失 → 孤儿轮收尾
+ *  - phase === 'navigating' / 'scrolling' → 看门狗到点，先问页面还在不在跑
  *  - phase === 'cooling' → 冷却结束，跑**下一轮**（runtime.round 是刚跑完的那轮）
  *  - phase === 'error'   → 上次失败，**重试本轮**
  *  - 其余（stopped / idle）→ 用户已主动停手，不动
@@ -497,7 +558,7 @@ async function resumeAfterWake(): Promise<void> {
     const rt = await getRuntime();
 
     if (rt.phase === 'navigating' || rt.phase === 'scrolling') {
-      await abandonInFlightRound(rt);
+      await reconcileInFlightRound(rt);
       return;
     }
 
@@ -506,30 +567,42 @@ async function resumeAfterWake(): Promise<void> {
 
     state.running = true;
     state.tabId = (await findXTab())?.id ?? null;
-    const roundArg = rt.phase === 'error' ? Math.max(0, rt.round - 1) : rt.round;
+    const nextRound = rt.phase === 'error' ? Math.max(1, rt.round) : rt.round + 1;
     await log(
       'INFO',
-      rt.phase === 'error' ? `重试第 ${roundArg + 1} 轮` : `冷却结束，开始第 ${roundArg + 1} 轮`,
+      rt.phase === 'error' ? `重试第 ${nextRound} 轮` : `冷却结束，开始第 ${nextRound} 轮`,
     );
-    await runRoundCycle(roundArg);
+    await runRoundCycle(nextRound);
   } finally {
     resuming = false;
   }
 }
 
 /**
- * 孤儿轮收尾：结果两条通道都没到（标签页被关、页面崩溃、脚本被卸载）。
+ * 看门狗到点时的孤儿轮处置。
  *
- * 必须先广播制动 —— 页面里的整轮循环是 content script 在跑，SW 死了它照旧运行；
- * 若直接进冷却，下一轮唤醒时上一轮的残留循环可能还在点按钮，动作翻倍正是
- * 账号风险最大的方向。
+ * 先问一次页面：还在跑就只是慢，走推迟路径，绝不开第二轮。
+ * 真的两条通道都没到（标签页被关、页面崩溃、脚本被卸载）才判定丢失。
+ *
+ * 判定丢失后必须先广播制动 —— 页面里的整轮循环是 content script 在跑，SW 死了它
+ * 照旧运行；若直接进冷却，下一轮唤醒时上一轮的残留循环可能还在点按钮，
+ * 动作翻倍正是账号风险最大的方向。
  */
-async function abandonInFlightRound(rt: AutomationRuntime): Promise<void> {
+async function reconcileInFlightRound(rt: AutomationRuntime): Promise<void> {
   state.running = true;
   state.tabId = (await findXTab())?.id ?? null;
+
+  if (state.tabId !== null) {
+    const res = await sendToTab<{ inFlight: boolean }>(state.tabId, { type: 'CS_ROUND_STATE' });
+    if (res.ok && res.data.inFlight) {
+      await deferForInFlightRound();
+      return;
+    }
+  }
+
   await log(
     'WARNING',
-    `第 ${rt.round + 1} 轮超过 ${Math.round(ROUND_WATCHDOG_MS / 60_000)} 分钟仍未回报结果，判定为丢失`,
+    `第 ${rt.round} 轮超过 ${Math.round(ROUND_WATCHDOG_MS / 60_000)} 分钟仍未回报结果，判定为丢失`,
   );
   if (state.tabId !== null) await sendToTab(state.tabId, { type: 'CS_ABORT' });
   if (rt.roundStartedAt !== null) await finalizeRound(rt.roundStartedAt, null);
